@@ -60,6 +60,17 @@
 //!
 //! You can also download from APKPure, but this should be used *only* for research purposes. Please see the [`USAGE-apkpure.md`](USAGE-apkpure.md) document.
 //!
+//! To download the APK offered by Huawei AppGallery for an explicitly chosen region:
+//!
+//! ```shell
+//! apkeep -a com.icbc -d huawei-app-gallery -o region=CN .
+//! ```
+//!
+//! The compatible default region is `IE`; there is no automatic region fallback. Only the
+//! latest APK offered to the configured client profile is available, not historical versions
+//! or necessarily the newest public release. See [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
+//! for regional availability, integrity checks, and error handling.
+//!
 //! Or, to download from RuStore:
 //!
 //! ```shell
@@ -106,6 +117,8 @@
 //!
 //! * The Google Play Store (`-d google-play`), given an email address and AAS token
 //! * APKPure (`-d apk-pure`), a third-party site hosting APKs available on the Play Store
+//! * Huawei AppGallery (`-d huawei-app-gallery`), with explicit regional selection and
+//!   verified full-APK downloads; see [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
 //! * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
 //! verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 //! was downloaded but could not be verified
@@ -226,6 +239,13 @@ async fn main() {
     if oauth_token.is_some() {
         download_source = DownloadSource::GooglePlay;
     }
+    let input_error = |message: &str| {
+        if download_source == DownloadSource::HuaweiAppGallery {
+            eprintln!("Huawei AppGallery: {message}");
+        } else {
+            println!("{}\n\n{}", usage, message);
+        }
+    };
     let list: Vec<(String, Option<String>)> = if oauth_token.is_none() {
         match matches.get_one::<String>("app") {
             Some(app) => {
@@ -242,29 +262,43 @@ async fn main() {
                 let field = *matches.get_one::<usize>("field").unwrap();
                 let version_field = matches.get_one::<usize>("version_field").map(|v| *v);
                 if field < 1 {
-                    println!("{}\n\nApp ID field must be 1 or greater", usage);
+                    input_error("App ID field must be 1 or greater");
                     std::process::exit(1);
                 }
                 if let Some(version_field) = version_field {
                     if version_field < 1 {
-                        println!("{}\n\nVersion field must be 1 or greater", usage);
+                        input_error("Version field must be 1 or greater");
                         std::process::exit(1);
                     }
                     if field == version_field {
-                        println!("{}\n\nApp ID and Version fields must be different", usage);
+                        input_error("App ID and Version fields must be different");
                         std::process::exit(1);
                     }
                 }
                 match fetch_csv_list(csv, field, version_field) {
                     Ok(csv_list) => csv_list,
                     Err(err) => {
-                        println!("{}\n\n{:?}", usage, err);
+                        input_error(&format!("{:?}", err));
                         std::process::exit(1);
                     }
                 }
             }
         }
     } else { Vec::new() };
+
+    let huawei_region = if download_source == DownloadSource::HuaweiAppGallery {
+        match download_sources::huawei_app_gallery::region(
+            matches.get_one::<String>("options").map(String::as_str),
+        ) {
+            Ok(region) => Some(region),
+            Err(error) => {
+                eprintln!("Huawei AppGallery: {error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     if let Some(true) = matches.get_one::<bool>("list_versions") {
         match download_source {
@@ -276,6 +310,11 @@ async fn main() {
             }
             DownloadSource::FDroid => {
                 fdroid::list_versions(list, options).await;
+            }
+            DownloadSource::HuaweiAppGallery => {
+                if !download_sources::huawei_app_gallery::list_versions(list) {
+                    std::process::exit(1);
+                }
             }
             DownloadSource::RuStore => {
                 rustore::list_versions(list).await;
@@ -296,13 +335,28 @@ async fn main() {
                     Some(outpath)
                 },
                 _ => {
-                    println!("{}\n\nOUTPATH is not a valid directory", usage);
+                    if download_source == DownloadSource::HuaweiAppGallery {
+                        eprintln!("Huawei AppGallery: OUTPATH is not a valid directory");
+                    } else {
+                        println!("{}\n\nOUTPATH is not a valid directory", usage);
+                    }
                     std::process::exit(1);
                 }
             }
         });
 
         match download_source {
+            DownloadSource::HuaweiAppGallery => {
+                if !download_sources::huawei_app_gallery::download_apps(
+                    list,
+                    parallel,
+                    sleep_duration,
+                    &outpath.unwrap(),
+                    huawei_region.as_deref().unwrap(),
+                ).await {
+                    std::process::exit(1);
+                }
+            }
             DownloadSource::APKPure => {
                 apkpure::download_apps(
                     list,
