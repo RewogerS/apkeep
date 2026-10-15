@@ -60,6 +60,15 @@
 //!
 //! You can also download from APKPure, but this should be used *only* for research purposes. Please see the [`USAGE-apkpure.md`](USAGE-apkpure.md) document.
 //!
+//! Or, to download from RuStore:
+//!
+//! ```shell
+//! apkeep -a com.vk.calls -d ru-store .
+//! ```
+//!
+//! For RuStore device/client options and its latest-only and split APK limitations,
+//! refer to [`USAGE-rustore.md`](USAGE-rustore.md).
+//!
 //! To download a specific version of an APK (possible for APKPure or F-Droid), use the `@version`
 //! convention:
 //!
@@ -100,6 +109,7 @@
 //! * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
 //! verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 //! was downloaded but could not be verified
+//! * RuStore (`-d ru-store`), a Russian app store platform
 //!
 //! # Usage Note
 //!
@@ -134,6 +144,7 @@ mod download_sources;
 use download_sources::google_play;
 use download_sources::fdroid;
 use download_sources::apkpure;
+use download_sources::rustore;
 
 type CSVList = Vec<(String, Option<String>)>;
 fn fetch_csv_list(csv: &str, field: usize, version_field: Option<usize>) -> Result<CSVList, Box<dyn Error>> {
@@ -266,6 +277,9 @@ async fn main() {
             DownloadSource::FDroid => {
                 fdroid::list_versions(list, options).await;
             }
+            DownloadSource::RuStore => {
+                rustore::list_versions(list).await;
+            }
         }
     } else {
         let parallel = matches.get_one::<usize>("parallel").map(|v| *v).unwrap();
@@ -384,6 +398,9 @@ async fn main() {
                     &outpath.unwrap(),
                     options,
                 ).await;
+            }
+            DownloadSource::RuStore => {
+                rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap(), options).await;
             }
         }
     }
