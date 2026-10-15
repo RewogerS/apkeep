@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Return nonzero when any RuStore download fails; reject zero parallelism before downloads or authentication.
+- Expand offline tests across CLI/input/config, RuStore, APKPure, F-Droid and Google Play listing.
+- Stop release artifact collection after failed SSH builds or SCP transfers; test with local command mocks.
+- Create missing configuration parent directories and update the locked rustls patch to 0.23.46.
+- Add a documented MIT-preserving local patch for the shared downloader: complete writes, flush before return, initialize SHA256 retry streams; test the actual dependency and F-Droid entry read path.
+- Add read-only test CI and document testing scope and remaining audit limitations.
 - Restore Huawei AppGallery with explicit `-o region=CN` selection (compatible `IE` default, no automatic fallback).
 - Validate Huawei API results and complete-APK metadata; verify SHA256 and size before atomic, no-clobber publication.
 - Report Huawei failures on stderr, including non-TTY runs, and return a nonzero status if any batch item fails.

@@ -28,6 +28,10 @@ use crate::util::{OutputFormat, progress_bar::progress_wrapper};
 mod error;
 use error::Error as FDroidError;
 
+#[cfg(test)]
+#[path = "fdroid_tests.rs"]
+mod tests;
+
 async fn retrieve_index_or_exit(options: &HashMap<&str, &str>, mp: Rc<MultiProgress>, output_format: OutputFormat) -> Value {
     let temp_dir = match tempdir() {
         Ok(temp_dir) => temp_dir,
@@ -315,6 +319,9 @@ fn parse_json_for_download_information(index: Value, apps: Vec<(String, Option<S
                             if app_version.is_none() || version_name == app_version.as_ref().unwrap() {
                                 if let (Some(Value::String(filename)), Some(Value::String(hash))) = (fdroid_app.get("apkName"), fdroid_app.get("hash")) {
                                     if let Ok(hash) = hex::decode(hash.to_string()) {
+                                        if filename.is_empty() || hash.len() != 32 {
+                                            continue;
+                                        }
                                         if let Some(arch) = &app_arch {
                                             if let Some(Value::Array(nativecode_array)) = fdroid_app.get("nativecode") {
                                                 if nativecode_array.iter().any(|value| {
@@ -337,24 +344,32 @@ fn parse_json_for_download_information(index: Value, apps: Vec<(String, Option<S
                     }
                 }
                 let arch_str = app_arch.as_ref().map_or("".to_string(), |x| format!(" {}", x));
-                mp_log.println(format!("Could not find version {}{} of {}. Skipping...", app_version.unwrap(), arch_str, app_id)).unwrap();
+                mp_log.println(format!("Could not find version {}{} of {}. Skipping...", app_version.as_deref().unwrap_or("latest"), arch_str, app_id)).unwrap();
                 return None;
             },
             Some(Value::Object(app_object)) => {
                 if let Some(Value::Object(versions)) = app_object.get("versions") {
                     let mut latest_version = 0;
                     let mut filename = String::new();
-                    let mut hash = String::new();
+                    let mut hash = Vec::new();
                     for (_, version_value) in versions {
                         if let Value::Object(version) = version_value {
                             if let (Some(Value::Object(manifest)), Some(Value::Object(file))) = (version.get("manifest"), version.get("file")) {
+                                if let Some(arch) = &app_arch {
+                                    if !manifest.get("nativecode").and_then(Value::as_array)
+                                        .is_some_and(|abis| abis.iter().any(|abi| abi.as_str() == Some(arch.as_str()))) {
+                                        continue;
+                                    }
+                                }
                                 if let (Some(Value::String(name)), Some(Value::String(sha256))) = (file.get("name"), file.get("sha256")) {
+                                    let sha256 = match hex::decode(sha256) {
+                                        Ok(hash) if hash.len() == 32 && !name.is_empty() => hash,
+                                        _ => continue,
+                                    };
                                     if app_version.is_some() {
                                         if let Some(Value::String(version_name)) = manifest.get("versionName") {
                                             if version_name == app_version.as_ref().unwrap() {
-                                                if let Ok(sha256) = hex::decode(sha256.to_string()) {
-                                                    return Some((app_id, app_version, name.to_string(), sha256));
-                                                }
+                                                return Some((app_id, app_version, name.to_string(), sha256));
                                             }
                                         }
                                     } else {
@@ -363,7 +378,7 @@ fn parse_json_for_download_information(index: Value, apps: Vec<(String, Option<S
                                                 if version_code > latest_version {
                                                     latest_version = version_code;
                                                     filename = name.to_string();
-                                                    hash = sha256.to_string();
+                                                    hash = sha256;
                                                 }
                                             }
                                         }
@@ -372,10 +387,8 @@ fn parse_json_for_download_information(index: Value, apps: Vec<(String, Option<S
                             }
                         }
                     }
-                    if app_version.is_none() {
-                        if let Ok(hash) = hex::decode(hash) {
-                            return Some((app_id, app_version, filename, hash));
-                        }
+                    if app_version.is_none() && !filename.is_empty() {
+                        return Some((app_id, app_version, filename, hash));
                     }
                 }
             },
@@ -603,6 +616,22 @@ async fn verify_and_return_index_from_entry(dir: &TempDir, repo: &str, json: &st
             std::process::exit(1);
         }
     };
+    // This name is used both in a URL and as a local path. Accept only literal,
+    // repository-relative components, never traversal or URL-encoded separators.
+    if !index_name.split('/').all(|part| {
+        !part.is_empty() && part != "." && part != ".."
+            && part.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    }) {
+        return Err(Box::new(SimpleError::new("Invalid F-Droid entry index name.")));
+    }
+    let index_sha256 = if verify_index {
+        match hex::decode(index_sha256) {
+            Ok(hash) if hash.len() == 32 => hash,
+            _ => return Err(Box::new(SimpleError::new("Invalid F-Droid entry index sha256: expected 32 bytes of hex."))),
+        }
+    } else {
+        Vec::new()
+    };
     let index_url = format!("{}/{}", repo, index_name);
     let mut dl = AsyncDownload::new(&index_url, dir.path(), &index_name).get().await.unwrap();
     let length = dl.length();
@@ -623,13 +652,6 @@ async fn verify_and_return_index_from_entry(dir: &TempDir, repo: &str, json: &st
                     hasher.update(index_file_data.clone());
                     Vec::from(hasher.finalize().as_slice())
                 };
-                let index_sha256 = match hex::decode(index_sha256) {
-                    Ok(index_sha256) => index_sha256,
-                    Err(_) => {
-                        print_error("Index sha256sum did not specify valid hex. Exiting.", output_format);
-                        std::process::exit(1);
-                    }
-                };
                 if index_sha256 != actual_index_shasum {
                     return Err(Box::new(SimpleError::new("The index sha256sum from the entry file does not match the actual index sha256sum.")));
                 }
@@ -645,7 +667,7 @@ async fn verify_and_return_index_from_entry(dir: &TempDir, repo: &str, json: &st
 }
 
 fn get_signed_data_from_cert_file(signature_block_file: PathBuf) -> Result<SignedData, Box<dyn Error>> {
-    let bytes = fs::read(signature_block_file).unwrap();
+    let bytes = fs::read(signature_block_file)?;
     match SignedData::parse_ber(&bytes) {
         Ok(signed_data) => {
             let certificates: Vec<&CapturedX509Certificate> = signed_data.certificates().collect();

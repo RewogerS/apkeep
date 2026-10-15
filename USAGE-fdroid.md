@@ -22,6 +22,8 @@ If a repo only supports the old (v1) package index, the newer [entry point speci
 apkeep -a org.torproject.android -d f-droid -o repo=https://guardianproject.info/fdroid/repo?fingerprint=B7C2EEFD8DAC7806AF67DFCD92EB18126BC08312A7F2D6F3862E46013C7A6135,use_entry=false .
 ```
 
+For safety, an entry index filename must use repository-relative path components containing only ASCII letters, digits, `.`, `_`, or `-` (a leading `/` is normalized). Empty, `.` and `..` components, encoded separators, and URL query/fragment syntax are rejected before downloading. APK candidates in either index format must have a nonempty filename and a hex SHA256 digest representing exactly 32 bytes; malformed candidates are skipped.
+
 A special option can also be used to skip verification of the repository index.  *Only use for debugging purposes*:
 
 ```shell

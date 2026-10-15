@@ -1,7 +1,9 @@
 #!/bin/bash
 # Build `apkeep` for release from a fresh Debian 13 x64 install
+set -euo pipefail
 
 ssh -o 'StrictHostKeyChecking no' apkeep-compiler << 'EOF'
+set -euo pipefail
 sudo dpkg --add-architecture armhf
 sudo dpkg --add-architecture i386
 sudo dpkg --add-architecture arm64

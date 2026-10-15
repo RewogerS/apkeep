@@ -22,7 +22,7 @@ impl fmt::Display for ConfigDirError {
 
 pub fn create_dir(config_dir: &PathBuf) -> Result<(), ConfigDirError> {
     if !config_dir.is_dir() {
-        fs::create_dir(config_dir).map_err(|_| { ConfigDirError::CouldNotCreate } )?;
+        fs::create_dir_all(config_dir).map_err(|_| ConfigDirError::CouldNotCreate)?;
     }
     Ok(())
 }
@@ -34,3 +34,7 @@ pub fn config_dir() -> Result<PathBuf, ConfigDirError> {
     create_dir(&config_dir)?;
     Ok(config_dir)
 }
+
+#[cfg(test)]
+#[path = "config_tests.rs"]
+mod tests;

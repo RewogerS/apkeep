@@ -150,6 +150,8 @@ mod cli;
 use cli::DownloadSource;
 
 mod config;
+#[cfg(test)]
+mod input_tests;
 mod consts;
 mod util;
 
@@ -242,6 +244,8 @@ async fn main() {
     let input_error = |message: &str| {
         if download_source == DownloadSource::HuaweiAppGallery {
             eprintln!("Huawei AppGallery: {message}");
+        } else if download_source == DownloadSource::RuStore {
+            eprintln!("RuStore: {message}");
         } else {
             println!("{}\n\n{}", usage, message);
         }
@@ -322,6 +326,14 @@ async fn main() {
         }
     } else {
         let parallel = matches.get_one::<usize>("parallel").map(|v| *v).unwrap();
+        if parallel == 0 {
+            if download_source == DownloadSource::HuaweiAppGallery {
+                eprintln!("Huawei AppGallery: nonempty app list and parallel >= 1 required");
+            } else {
+                eprintln!("parallel must be greater than zero");
+            }
+            std::process::exit(1);
+        }
         let sleep_duration = matches.get_one::<u64>("sleep_duration").map(|v| *v).unwrap();
         let outpath = matches.get_one::<String>("OUTPATH").map_or_else(|| {
             if oauth_token.is_none() {
@@ -337,6 +349,8 @@ async fn main() {
                 _ => {
                     if download_source == DownloadSource::HuaweiAppGallery {
                         eprintln!("Huawei AppGallery: OUTPATH is not a valid directory");
+                    } else if download_source == DownloadSource::RuStore {
+                        eprintln!("RuStore: OUTPATH is not a valid directory");
                     } else {
                         println!("{}\n\nOUTPATH is not a valid directory", usage);
                     }
@@ -454,7 +468,9 @@ async fn main() {
                 ).await;
             }
             DownloadSource::RuStore => {
-                rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap(), options).await;
+                if !rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap(), options).await {
+                    std::process::exit(1);
+                }
             }
         }
     }

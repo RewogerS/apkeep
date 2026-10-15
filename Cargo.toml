@@ -34,3 +34,7 @@ indicatif = "0.18"
 
 [build-dependencies]
 clap = { version = "4", features = ["derive"] }
+
+[patch.crates-io]
+# Preserve EFF's API/license; see third-party/tokio-dl-stream-to-disk/PATCHES.md.
+tokio-dl-stream-to-disk = { path = "third-party/tokio-dl-stream-to-disk" }

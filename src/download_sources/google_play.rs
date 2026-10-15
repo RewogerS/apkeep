@@ -10,6 +10,10 @@ use tokio::time::{sleep, Duration as TokioDuration};
 
 use crate::util::progress_bar::progress_wrapper;
 
+#[cfg(test)]
+#[path = "google_play_tests.rs"]
+mod tests;
+
 pub async fn download_apps(
     apps: Vec<(String, Option<String>)>,
     parallel: usize,

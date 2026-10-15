@@ -1,4 +1,4 @@
-use clap::{value_parser, Command, Arg, ArgAction, ValueEnum, {builder::EnumValueParser}};
+use clap::{builder::EnumValueParser, value_parser, Arg, ArgAction, Command, ValueEnum};
 
 #[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
 pub enum DownloadSource {
@@ -30,6 +30,10 @@ impl std::str::FromStr for DownloadSource {
         Err(format!("Invalid variant: {}", s))
     }
 }
+
+#[cfg(test)]
+#[path = "cli_tests.rs"]
+mod tests;
 
 pub fn app() -> Command {
     Command::new("apkeep")

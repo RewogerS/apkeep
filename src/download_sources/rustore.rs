@@ -7,7 +7,6 @@ use indicatif::MultiProgress;
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{json, Value};
 use tokio::time::{sleep, Duration as TokioDuration};
-use tokio_dl_stream_to_disk::{error::ErrorKind as TDSTDErrorKind, AsyncDownload};
 
 use crate::util::progress_bar::progress_wrapper;
 
@@ -115,20 +114,6 @@ impl RustoreOptions {
     }
 }
 
-async fn get_app_id(
-    http_client: &reqwest::Client,
-    headers: &HeaderMap,
-    package_name: &str,
-) -> Result<u64, String> {
-    get_app_id_at(
-        http_client,
-        headers,
-        package_name,
-        "https://backapi.rustore.ru/applicationData/store-app",
-    )
-    .await
-}
-
 // Private transport seam for loopback tests; endpoints are not user-configurable.
 async fn get_app_id_at(
     http_client: &reqwest::Client,
@@ -149,20 +134,6 @@ async fn get_app_id_at(
         .and_then(Value::as_u64)
         .filter(|id| *id > 0)
         .ok_or_else(|| "RuStore malformed response: missing or invalid app id".to_string())
-}
-
-async fn get_download_url(
-    http_client: &reqwest::Client,
-    config: &RustoreOptions,
-    app_id: u64,
-) -> Result<String, String> {
-    get_download_url_at(
-        http_client,
-        config,
-        app_id,
-        "https://backapi.rustore.ru/applicationData/v2/download-link",
-    )
-    .await
 }
 
 async fn get_download_url_at(
@@ -231,42 +202,96 @@ pub async fn download_apps(
     sleep_duration: u64,
     outpath: &Path,
     options: HashMap<&str, &str>,
-) {
+) -> bool {
+    download_apps_at(
+        apps,
+        parallel,
+        sleep_duration,
+        outpath,
+        options,
+        (
+            "https://backapi.rustore.ru/applicationData/store-app",
+            "https://backapi.rustore.ru/applicationData/v2/download-link",
+        ),
+    )
+    .await
+}
+
+fn valid_package_name(package: &str) -> bool {
+    package.split('.').all(|segment| {
+        let mut bytes = segment.bytes();
+        matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    })
+}
+
+// Private transport seam only: production endpoints are fixed above.
+async fn download_apps_at(
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep_duration: u64,
+    outpath: &Path,
+    options: HashMap<&str, &str>,
+    endpoints: (&str, &str),
+) -> bool {
+    if parallel == 0 {
+        eprintln!("RuStore parallel must be greater than zero");
+        return false;
+    }
+    if apps.is_empty() {
+        eprintln!("No RuStore apps to download");
+        return false;
+    }
     let env_version = std::env::var("APKEEP_RUSTORE_VER");
     if !options.contains_key("rustore_version")
         && matches!(env_version, Err(std::env::VarError::NotUnicode(_)))
     {
         eprintln!("Invalid RuStore APKEEP_RUSTORE_VER: expected a positive decimal version code");
-        return;
+        return false;
     }
     let config = match RustoreOptions::parse(&options, env_version.as_deref().ok()) {
         Ok(config) => config,
         Err(error) => {
             eprintln!("{error}");
-            return;
+            return false;
         }
     };
     let http_client = Rc::new(reqwest::Client::new());
 
     let mp = Rc::new(MultiProgress::new());
-    futures_util::stream::iter(apps.into_iter().map(|app| {
+    let results = futures_util::stream::iter(apps.into_iter().map(|app| {
         let (app_id, app_version) = app;
         let http_client = Rc::clone(&http_client);
         let config = config.clone();
         let mp = Rc::clone(&mp);
         let mp_log = Rc::clone(&mp);
         async move {
+            if !valid_package_name(&app_id) {
+                mp_log.suspend(|| {
+                    eprintln!(
+                        "Invalid RuStore package name: expected dot-separated ASCII identifiers"
+                    )
+                });
+                return false;
+            }
             if app_version.is_none() {
                 mp_log.suspend(|| println!("Downloading {}...", app_id));
                 if sleep_duration > 0 {
                     sleep(TokioDuration::from_millis(sleep_duration)).await;
                 }
 
-                match get_app_id(&http_client, &config.headers, &app_id).await {
+                match get_app_id_at(&http_client, &config.headers, &app_id, endpoints.0).await {
                     Ok(rustore_app_id) => {
-                        match get_download_url(&http_client, &config, rustore_app_id).await {
+                        match get_download_url_at(
+                            &http_client,
+                            &config,
+                            rustore_app_id,
+                            endpoints.1,
+                        )
+                        .await
+                        {
                             Ok(download_url) => {
-                                download_apk(download_url, app_id.to_string(), outpath, mp).await;
+                                download_apk(download_url, app_id.to_string(), outpath, mp).await
                             }
                             Err(error) => {
                                 mp_log.suspend(|| {
@@ -275,6 +300,7 @@ pub async fn download_apps(
                                         app_id, error
                                     )
                                 });
+                                false
                             }
                         }
                     }
@@ -282,22 +308,24 @@ pub async fn download_apps(
                         mp_log.suspend(|| {
                             eprintln!("Could not look up {}: {}. Skipping...", app_id, error)
                         });
+                        false
                     }
                 }
             } else {
                 mp_log.suspend(|| {
                     eprintln!(
-                        "Specific versions can not be downloaded from RuStore ({}@{}). Skipping...",
-                        app_id,
-                        app_version.unwrap()
+                        "Specific versions can not be downloaded from RuStore ({}). Skipping...",
+                        app_id
                     )
                 });
+                false
             }
         }
     }))
     .buffer_unordered(parallel)
-    .collect::<Vec<()>>()
+    .collect::<Vec<bool>>()
     .await;
+    results.into_iter().all(|success| success)
 }
 
 async fn download_apk(
@@ -305,80 +333,92 @@ async fn download_apk(
     app_string: String,
     outpath: &Path,
     mp: Rc<MultiProgress>,
-) {
-    let mp_log = Rc::clone(&mp);
-    let mp = Rc::clone(&mp);
+) -> bool {
+    use tokio::io::AsyncWriteExt;
+
+    if !valid_package_name(&app_string) {
+        mp.suspend(|| {
+            eprintln!("Invalid RuStore package name: expected dot-separated ASCII identifiers")
+        });
+        return false;
+    }
     let fname = format!("{}.apk", app_string);
-
-    match AsyncDownload::new(&download_url, Path::new(outpath), &fname)
-        .get()
-        .await
-    {
-        Ok(mut dl) => {
-            let length = dl.length();
-            let cb = length.map(|length| progress_wrapper(mp)(fname.clone(), length));
-
-            match dl.download(&cb).await {
-                Ok(_) => mp_log.suspend(|| println!("{} downloaded successfully!", app_string)),
-                Err(err) if matches!(err.kind(), TDSTDErrorKind::FileExists) => {
-                    mp_log
-                        .println(format!(
-                            "File already exists for {}. Skipping...",
-                            app_string
-                        ))
-                        .unwrap();
-                }
-                Err(err) if matches!(err.kind(), TDSTDErrorKind::PermissionDenied) => {
-                    mp_log
-                        .println(format!(
-                            "Permission denied when attempting to write file for {}. Skipping...",
-                            app_string
-                        ))
-                        .unwrap();
-                }
-                Err(_) => {
-                    mp_log
-                        .println(format!(
-                            "An error has occurred attempting to download {}.  Retry #1...",
-                            app_string
-                        ))
-                        .unwrap();
-                    match AsyncDownload::new(&download_url, Path::new(outpath), &fname)
-                        .download(&cb)
-                        .await
-                    {
-                        Ok(_) => {
-                            mp_log.suspend(|| println!("{} downloaded successfully!", app_string))
-                        }
-                        Err(_) => {
-                            mp_log
-                                .println(format!(
-                                    "An error has occurred attempting to download {}.  Retry #2...",
-                                    app_string
-                                ))
-                                .unwrap();
-                            match AsyncDownload::new(&download_url, Path::new(outpath), &fname)
-                                .download(&cb)
-                                .await
-                            {
-                                Ok(_) => mp_log.suspend(|| {
-                                    println!("{} downloaded successfully!", app_string)
-                                }),
-                                Err(_) => {
-                                    mp_log.println(format!("An error has occurred attempting to download {}. Skipping...", app_string)).unwrap();
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    let destination = outpath.join(&fname);
+    match std::fs::symlink_metadata(&destination) {
+        Ok(metadata) if metadata.file_type().is_file() => {
+            mp.suspend(|| println!("File already exists for {}. Skipping...", app_string));
+            return true;
         }
-        Err(_) => {
-            mp_log
-                .println(format!("Invalid response for {}. Skipping...", app_string))
-                .unwrap();
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => {
+            mp.suspend(|| {
+                eprintln!(
+                    "Unsafe or inaccessible RuStore output file for {}. Skipping...",
+                    app_string
+                )
+            });
+            return false;
         }
     }
+    let client = reqwest::Client::new();
+    for attempt in 1..=3 {
+        let result = async {
+            let mut response = client
+                .get(&download_url)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|_| "Invalid response")?;
+            let temporary = tempfile::Builder::new()
+                .prefix(".apkeep-rustore-")
+                .tempfile_in(outpath)
+                .map_err(|_| "Could not create download file")?;
+            let mut file = tokio::fs::File::from_std(
+                temporary
+                    .reopen()
+                    .map_err(|_| "Could not open download file")?,
+            );
+            let cb = response
+                .content_length()
+                .map(|length| progress_wrapper(Rc::clone(&mp))(fname.clone(), length));
+            let mut downloaded = 0;
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|_| "Could not read download")?
+            {
+                file.write_all(&chunk)
+                    .await
+                    .map_err(|_| "Could not write download file")?;
+                downloaded += chunk.len() as u64;
+                if let Some(cb) = &cb {
+                    cb(downloaded);
+                }
+            }
+            if downloaded == 0 {
+                return Err("Empty download response");
+            }
+            file.flush()
+                .await
+                .map_err(|_| "Could not flush download file")?;
+            drop(file);
+            temporary
+                .persist_noclobber(&destination)
+                .map_err(|_| "Could not publish download file")?;
+            Ok::<(), &str>(())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                mp.suspend(|| println!("{} downloaded successfully!", app_string));
+                return true;
+            }
+            Err(error) => {
+                mp.suspend(|| eprintln!("{} for {} (attempt {}).", error, app_string, attempt))
+            }
+        }
+    }
+    false
 }
 
 pub async fn list_versions(apps: Vec<(String, Option<String>)>) {

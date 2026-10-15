@@ -1,7 +1,8 @@
 # Downloading from RuStore
 
 Select RuStore with `-d ru-store`. Only the latest available version is supported;
-`package@version` requests are skipped with a diagnostic. Listing versions with
+`package@version` requests are skipped with a diagnostic and make the download
+command fail. Listing versions with
 `-l` explains this limitation rather than returning historical versions.
 
 ```shell
@@ -73,6 +74,36 @@ RuStore network requests. Diagnostics name the invalid option/source without
 printing its value. HTTP errors, network/read errors, malformed responses,
 application-not-found results, and API rejections are reported separately, without
 printing response bodies or signed download URLs.
+
+## Exit status and output safety
+
+RuStore download commands exit with status `0` only when every requested app
+was downloaded successfully or its existing regular output file was skipped.
+Invalid selected configuration/environment, an empty app list, unsupported
+version pins, invalid package names, lookup/link/API/HTTP errors, and failed or
+empty downloads produce a nonzero status. Batch processing still attempts every
+item and keeps successful downloads even when other items fail. Diagnostics go
+to stderr; progress and successful-download/skip messages go to stdout. Invalid
+option values, untrusted version strings, response bodies and signed download
+URLs are not printed.
+
+For downloads, `-r/--parallel` must be greater than zero (for every source), and
+is rejected before starting downloads or Google authentication. RuStore also
+validates this in its download helper. `-l` remains an offline explanation of the
+latest-only limitation; it does not validate unused download options.
+
+Package names must consist of dot-separated nonempty ASCII identifiers, each
+starting with a letter or `_`, followed by letters, digits or `_`. Path separators,
+query/fragment syntax and control characters are rejected before RuStore network
+requests. Output is named `<package>.apk` inside OUTPATH. Existing symlinks and
+other nonregular entries are errors, not successful skips. New downloads use a
+private temporary file, are flushed before no-clobber publication, and are cleaned
+up after failed transfers; a failed retry cannot turn a partial file into success.
+There are at most three transfer attempts.
+
+Existing regular files are preserved **without revalidation**. A successful HTTP
+transfer is not an APK signature, ZIP/manifest, or API-checksum verification; use a
+fresh output directory and independently verify downloaded APKs when required.
 
 ## Split APK limitation
 

@@ -15,6 +15,32 @@ use tokio::time::{sleep, Duration as TokioDuration};
 
 use crate::util::{OutputFormat, progress_bar::progress_wrapper};
 
+#[cfg(test)]
+#[path = "apkpure_tests.rs"]
+mod tests;
+
+fn download_regex(version: Option<&str>) -> Regex {
+    match version {
+        Some(version) => {
+            let pattern = format!(
+                "[[:^digit:]]{}:(?s:.)+?{}",
+                regex::escape(version),
+                crate::consts::APKPURE_DOWNLOAD_URL_REGEX,
+            );
+            Regex::new(&pattern).unwrap()
+        },
+        None => Regex::new(crate::consts::APKPURE_DOWNLOAD_URL_REGEX).unwrap(),
+    }
+}
+
+fn versions_url(app_id: &str) -> Url {
+    Url::parse(&format!("{}{}", crate::consts::APKPURE_VERSIONS_URL_FORMAT, app_id)).unwrap()
+}
+
+fn versions_regex() -> Regex {
+    Regex::new(r"([[:alnum:]\.-]+):\([[:xdigit:]]{40,}").unwrap()
+}
+
 fn http_headers(options: &HashMap<&str, &str>) -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert("x-cv", HeaderValue::from_static("3172501"));
@@ -59,7 +85,7 @@ pub async fn download_apps(
     let http_client = Rc::new(reqwest::Client::new());
     let app_arch = options.get("arch").cloned();
     let headers = http_headers(&options);
-    let re = Rc::new(Regex::new(crate::consts::APKPURE_DOWNLOAD_URL_REGEX).unwrap());
+    let re = Rc::new(download_regex(None));
 
     futures_util::stream::iter(
         apps.into_iter().map(|app| {
@@ -91,14 +117,13 @@ pub async fn download_apps(
                 if sleep_duration > 0 {
                     sleep(TokioDuration::from_millis(sleep_duration)).await;
                 }
-                let versions_url = Url::parse(&format!("{}{}", crate::consts::APKPURE_VERSIONS_URL_FORMAT, app_id)).unwrap();
+                let versions_url = versions_url(&app_id);
                 let versions_response = http_client
                     .get(versions_url)
                     .headers(headers)
                     .send().await.unwrap();
                 if let Some(app_version) = app_version {
-                    let regex_string = format!("[[:^digit:]]{}:(?s:.)+?{}", regex::escape(&app_version), crate::consts::APKPURE_DOWNLOAD_URL_REGEX);
-                    let re = Regex::new(&regex_string).unwrap();
+                    let re = download_regex(Some(&app_version));
                     download_from_response(versions_response, Box::new(Box::new(re)), app_string, outpath, mp).await;
                 } else {
                     download_from_response(versions_response, Box::new(re), app_string, outpath, mp).await;
@@ -175,7 +200,7 @@ async fn download_from_response(response: Response, re: Box<dyn Deref<Target=Reg
 
 pub async fn list_versions(apps: Vec<(String, Option<String>)>, options: HashMap<&str, &str>) {
     let http_client = Rc::new(reqwest::Client::new());
-    let re = Rc::new(Regex::new(r"([[:alnum:]\.-]+):\([[:xdigit:]]{40,}").unwrap());
+    let re = Rc::new(versions_regex());
     let headers = http_headers(&options);
     let output_format = match options.get("output_format") {
         Some(val) if val.to_lowercase() == "json" => OutputFormat::Json,
@@ -197,7 +222,7 @@ pub async fn list_versions(apps: Vec<(String, Option<String>)>, options: HashMap
             if output_format.is_plaintext() {
                 println!("Versions available for {} on APKPure:", app_id);
             }
-            let versions_url = Url::parse(&format!("{}{}", crate::consts::APKPURE_VERSIONS_URL_FORMAT, app_id)).unwrap();
+            let versions_url = versions_url(&app_id);
             let versions_response = http_client
                 .get(versions_url)
                 .headers(headers)
