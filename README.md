@@ -79,6 +79,15 @@ latest APK offered to the configured client profile is available, not historical
 or necessarily the newest public release. See [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
 for regional availability, integrity checks, and error handling.
 
+Or, to download from RuStore:
+
+```shell
+apkeep -a com.vk.calls -d ru-store .
+```
+
+For RuStore device/client options and its latest-only and split APK limitations,
+refer to [`USAGE-rustore.md`](USAGE-rustore.md).
+
 To download a specific version of an APK (possible for APKPure or F-Droid), use the `@version`
 convention:
 
@@ -121,6 +130,7 @@ You can use this tool to download from a few distinct sources.
 * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
 verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 was downloaded but could not be verified
+* RuStore (`-d ru-store`), a Russian app store platform
 
 ## Usage Note
 
