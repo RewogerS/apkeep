@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+- Restore Huawei AppGallery with explicit `-o region=CN` selection (compatible `IE` default, no automatic fallback).
+- Validate Huawei API results and complete-APK metadata; verify SHA256 and size before atomic, no-clobber publication.
+- Report Huawei failures on stderr, including non-TTY runs, and return a nonzero status if any batch item fails.
+- Add offline loopback HTTP and CLI regression tests for Huawei AppGallery.
+
 ## [1.1.0] - 2026-10-01
 - Add warnings and explicit flag requirement to download from APKPure
 - Make Googe Play the default download source
