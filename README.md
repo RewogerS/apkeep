@@ -47,15 +47,11 @@ The simplest example is to download a single APK to the current directory:
 apkeep -a com.instagram.android .
 ```
 
-This downloads from the default source, APKPure, which does not require credentials. For more
-APKPure usage examples, such as specifying a package architecture, refer to the
-[`USAGE-apkpure.md`](USAGE-apkpure.md) document.
-
-To download directly from the google play store, you will first have to [obtain an AAS token](USAGE-google-play.md).
+To download directly from the default source, Google Play, you will first have to [obtain an AAS token](USAGE-google-play.md).
 Then,
 
 ```shell
-apkeep -a com.instagram.android -d google-play -e 'someone@gmail.com' -t aas_token .
+apkeep -a com.instagram.android -e 'someone@gmail.com' -t aas_token .
 ```
 
 For more google play usage examples, such as specifying a device configuration, timezone or
@@ -70,11 +66,7 @@ apkeep -a org.mozilla.fennec_fdroid -d f-droid .
 For more F-Droid usage examples, such as downloading from F-Droid mirrors or other F-Droid
 repositories, refer to the [`USAGE-fdroid.md`](USAGE-fdroid.md) document.
 
-Or, to download from the Huawei AppGallery:
-
-```shell
-apkeep -a com.elysiumlabs.newsbytes -d huawei-app-gallery .
-```
+You can also download from APKPure, but this should be used *only* for research purposes. Please see the [`USAGE-apkpure.md`](USAGE-apkpure.md) document.
 
 Or, to download from RuStore:
 
@@ -125,7 +117,6 @@ You can use this tool to download from a few distinct sources.
 * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
 verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 was downloaded but could not be verified
-* The Huawei AppGallery (`-d huawei-app-gallery`), an app store popular in China
 * RuStore (`-d ru-store`), a Russian app store platform
 
 ## Usage Note

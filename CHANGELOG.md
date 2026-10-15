@@ -5,8 +5,21 @@ All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
-- Add the ability to download dex metadata for an app from Google Play
-- Added RuStore support
+- Add RuStore support with configurable device/client options and validated API responses
+
+## [1.1.0] - 2026-10-01
+- Add warnings and explicit flag requirement to download from APKPure
+- Make Googe Play the default download source
+- Remove Huawei AppGallery (nonworking)
+- Update dependencies
+
+## [1.0.0] - 2026-04-29
+- Google Play:
+  - Add the ability to download dex metadata for an app
+  - Fix authentication bug introduced by Google auth flow change
+  - Allow users to specify their own device properties files
+  - Allow authentication with auth-token as alternative to aas-token
+- Update dependencies
 
 ## [0.18.0] - 2025-10-30
 - Adding the ability to specify json as an output format when listing versions of an app available

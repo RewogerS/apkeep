@@ -47,6 +47,14 @@ pub async fn download_apps(
     outpath: &Path,
     options: HashMap<&str, &str>,
 ) {
+    match options.get("acknowledge_dangers") {
+        Some(val) if *val == "1" || val.to_lowercase() == "true" => {},
+        _ => {
+            eprintln!("The dangers of using this download source must be explicitly acknowledged: https://github.com/EFForg/apkeep/blob/master/USAGE-apkpure.md");
+            std::process::exit(1);
+        }
+    }
+
     let mp = Rc::new(MultiProgress::new());
     let http_client = Rc::new(reqwest::Client::new());
     let app_arch = options.get("arch").cloned();
@@ -64,19 +72,19 @@ pub async fn download_apps(
             async move {
                 let app_string = match (&app_version, app_arch) {
                     (None, None) => {
-                        mp_log.suspend(|| println!("Downloading {}...", app_id));
+                        mp_log.suspend(|| println!("Downloading {} from APKPure...", app_id));
                         app_id.to_string()
                     },
                     (None, Some(ref arch)) => {
-                        mp_log.suspend(|| println!("Downloading {} arch {}...", app_id, arch));
+                        mp_log.suspend(|| println!("Downloading {} arch {} from APKPure...", app_id, arch));
                         format!("{}@{}", app_id, arch)
                     },
                     (Some(ref version), None) => {
-                        mp_log.suspend(|| println!("Downloading {} version {}...", app_id, version));
+                        mp_log.suspend(|| println!("Downloading {} version {} from APKPure...", app_id, version));
                         format!("{}@{}", app_id, version)
                     },
                     (Some(ref version), Some(ref arch)) => {
-                        mp_log.suspend(|| println!("Downloading {} version {} arch {}...", app_id, version, arch));
+                        mp_log.suspend(|| println!("Downloading {} version {} arch {} from APKPure...", app_id, version, arch));
                         format!("{}@{}@{}", app_id, version, arch)
                     },
                 };

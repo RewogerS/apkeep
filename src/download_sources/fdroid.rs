@@ -216,19 +216,19 @@ pub async fn download_apps(
             async move {
                 let app_string = match (app_version, app_arch) {
                     (None, None) => {
-                        mp_log.suspend(|| println!("Downloading {}...", app_id));
+                        mp_log.suspend(|| println!("Downloading {} from F-Droid...", app_id));
                         app_id.to_string()
                     },
                     (None, Some(arch)) => {
-                        mp_log.suspend(|| println!("Downloading {} arch {}...", app_id, arch));
+                        mp_log.suspend(|| println!("Downloading {} arch {} from F-Droid...", app_id, arch));
                         format!("{}@{}", app_id, arch)
                     },
                     (Some(version), None) => {
-                        mp_log.suspend(|| println!("Downloading {} version {}...", app_id, version));
+                        mp_log.suspend(|| println!("Downloading {} version {} from F-Droid...", app_id, version));
                         format!("{}@{}", app_id, version)
                     },
                     (Some(version), Some(arch)) => {
-                        mp_log.suspend(|| println!("Downloading {} version {} arch {}...", app_id, version, arch));
+                        mp_log.suspend(|| println!("Downloading {} version {} arch {} from F-Droid...", app_id, version, arch));
                         format!("{}@{}@{}", app_id, version, arch)
                     },
                 };
@@ -539,11 +539,11 @@ fn verify_and_return_json(dir: &TempDir, files: &[String], fingerprint: &[u8], v
         let actual_manifest_shasum = if use_entry {
             let mut hasher = Sha256::new();
             hasher.update(manifest_file_data.clone());
-            hasher.finalize().to_vec()
+            Vec::from(hasher.finalize().as_slice())
         } else {
             let mut hasher = Sha1::new();
             hasher.update(manifest_file_data.clone());
-            hasher.finalize().to_vec()
+            Vec::from(hasher.finalize().as_slice())
         };
         if signed_file_manifest_shasum != actual_manifest_shasum[..] {
             return Err(Box::new(SimpleError::new(format!("The manifest {} from the signed file does not match the actual manifest {}.", sha_algorithm_name, sha_algorithm_name))));
@@ -572,11 +572,11 @@ fn verify_and_return_json(dir: &TempDir, files: &[String], fingerprint: &[u8], v
         let actual_shasum = if use_entry {
             let mut hasher = Sha256::new();
             hasher.update(json_file_data.clone());
-            hasher.finalize().to_vec()
+            Vec::from(hasher.finalize().as_slice())
         } else {
             let mut hasher = Sha1::new();
             hasher.update(json_file_data.clone());
-            hasher.finalize().to_vec()
+            Vec::from(hasher.finalize().as_slice())
         };
         if manifest_file_shasum != actual_shasum[..] {
             return Err(Box::new(SimpleError::new(format!("The {} from the manifest file does not match the actual {}.", file_algo, file_algo))));
@@ -621,7 +621,7 @@ async fn verify_and_return_index_from_entry(dir: &TempDir, repo: &str, json: &st
                 let actual_index_shasum = {
                     let mut hasher = Sha256::new();
                     hasher.update(index_file_data.clone());
-                    hasher.finalize().to_vec()
+                    Vec::from(hasher.finalize().as_slice())
                 };
                 let index_sha256 = match hex::decode(index_sha256) {
                     Ok(index_sha256) => index_sha256,

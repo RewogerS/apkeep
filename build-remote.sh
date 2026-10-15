@@ -29,9 +29,9 @@ export PKG_CONFIG_PATH="/usr/lib/aarch-linux-gnu-gcc/pkgconfig"
 cargo build --release --target=aarch64-unknown-linux-gnu
 
 cd ~
-wget https://github.com/openssl/openssl/releases/download/openssl-3.5.4/openssl-3.5.4.tar.gz
-tar -zxvf openssl-3.5.4.tar.gz
-cd openssl-3.5.4
+wget https://github.com/openssl/openssl/releases/download/openssl-3.6.2/openssl-3.6.2.tar.gz
+tar -zxvf openssl-3.6.2.tar.gz
+cd openssl-3.6.2
 wget https://raw.githubusercontent.com/EFForg/apkeep-files/main/Configurations-15-android.conf.patch
 patch -u Configurations/15-android.conf Configurations-15-android.conf.patch
 export OPENSSL_DIR=$PWD
@@ -47,32 +47,32 @@ export NEWPATH="$PWD/toolchains/llvm/prebuilt/linux-x86_64/bin"
 export PATH="$NEWPATH:$PATH"
 export AR="llvm-ar"
 cd $NEWPATH
-ln -s armv7a-linux-androideabi26-clang arm-linux-androideabi-clang
-ln -s i686-linux-android26-clang i686-linux-android-clang
+ln -s armv7a-linux-androideabi27-clang arm-linux-androideabi-clang
+ln -s i686-linux-android27-clang i686-linux-android-clang
 
 cd $OPENSSL_DIR
-./Configure android-arm64 -D__ANDROID_MIN_SDK_VERSION__=26
+./Configure android-arm64 -D__ANDROID_MIN_SDK_VERSION__=27
 make
 cd ../apkeep
 cargo build --release --target=aarch64-linux-android
 
 cd $OPENSSL_DIR
 make clean
-./Configure android-arm -D__ANDROID_MIN_SDK_VERSION__=26
+./Configure android-arm -D__ANDROID_MIN_SDK_VERSION__=27
 make
 cd ../apkeep
 cargo build --release --target=armv7-linux-androideabi
 
 cd $OPENSSL_DIR
 make clean
-./Configure android-x86 -D__ANDROID_MIN_SDK_VERSION__=26
+./Configure android-x86 -D__ANDROID_MIN_SDK_VERSION__=27
 make
 cd ../apkeep
 cargo build --release --target=i686-linux-android
 
 cd $OPENSSL_DIR
 make clean
-./Configure android-x86_64 -D__ANDROID_MIN_SDK_VERSION__=26
+./Configure android-x86_64 -D__ANDROID_MIN_SDK_VERSION__=27
 make
 cd ../apkeep
 cargo build --release --target=x86_64-linux-android
@@ -84,7 +84,7 @@ sudo ln -s clang-19 /usr/bin/clang && sudo ln -s clang /usr/bin/clang++ && sudo 
 sudo ln -s clang-19 /usr/bin/clang-cl && sudo ln -s llvm-ar-19 /usr/bin/llvm-lib && sudo ln -s lld-link-19 /usr/bin/lld-link && sudo ln -s lld-link /usr/bin/link.exe
 
 cd ~
-XWIN_VERSION="0.6.7"
+XWIN_VERSION="0.9.0"
 XWIN_PREFIX="xwin-$XWIN_VERSION-x86_64-unknown-linux-musl"
 curl --fail -L https://github.com/Jake-Shadle/xwin/releases/download/$XWIN_VERSION/$XWIN_PREFIX.tar.gz | tar -xzv -C ~/.cargo/bin --strip-components=1 $XWIN_PREFIX/xwin
 cd ~ && mkdir xwin

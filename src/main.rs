@@ -39,15 +39,11 @@
 //! apkeep -a com.instagram.android .
 //! ```
 //!
-//! This downloads from the default source, APKPure, which does not require credentials. For more
-//! APKPure usage examples, such as specifying a package architecture, refer to the
-//! [`USAGE-apkpure.md`](USAGE-apkpure.md) document.
-//!
-//! To download directly from the google play store, you will first have to [obtain an AAS token](USAGE-google-play.md).
+//! To download directly from the default source, Google Play, you will first have to [obtain an AAS token](USAGE-google-play.md).
 //! Then,
 //!
 //! ```shell
-//! apkeep -a com.instagram.android -d google-play -e 'someone@gmail.com' -t aas_token .
+//! apkeep -a com.instagram.android -e 'someone@gmail.com' -t aas_token .
 //! ```
 //!
 //! For more google play usage examples, such as specifying a device configuration, timezone or
@@ -62,11 +58,7 @@
 //! For more F-Droid usage examples, such as downloading from F-Droid mirrors or other F-Droid
 //! repositories, refer to the [`USAGE-fdroid.md`](USAGE-fdroid.md) document.
 //!
-//! Or, to download from the Huawei AppGallery:
-//!
-//! ```shell
-//! apkeep -a com.elysiumlabs.newsbytes -d huawei-app-gallery .
-//! ```
+//! You can also download from APKPure, but this should be used *only* for research purposes. Please see the [`USAGE-apkpure.md`](USAGE-apkpure.md) document.
 //!
 //! Or, to download from RuStore:
 //!
@@ -117,7 +109,6 @@
 //! * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
 //! verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 //! was downloaded but could not be verified
-//! * The Huawei AppGallery (`-d huawei-app-gallery`), an app store popular in China
 //! * RuStore (`-d ru-store`), a Russian app store platform
 //!
 //! # Usage Note
@@ -153,7 +144,6 @@ mod download_sources;
 use download_sources::google_play;
 use download_sources::fdroid;
 use download_sources::apkpure;
-use download_sources::huawei_app_gallery;
 use download_sources::rustore;
 
 type CSVList = Vec<(String, Option<String>)>;
@@ -287,9 +277,6 @@ async fn main() {
             DownloadSource::FDroid => {
                 fdroid::list_versions(list, options).await;
             }
-            DownloadSource::HuaweiAppGallery => {
-                huawei_app_gallery::list_versions(list).await;
-            }
             DownloadSource::RuStore => {
                 rustore::list_versions(list).await;
             }
@@ -336,7 +323,8 @@ async fn main() {
                     ).await;
                 } else {
                     let mut aas_token = matches.get_one::<String>("google_aas_token").map(|v| v.to_string());
-                    let accept_tos = match matches.get_one::<bool>("list_versions") {
+                    let mut auth_token = matches.get_one::<String>("google_auth_token").map(|v| v.to_string());
+                    let accept_tos = match matches.get_one::<bool>("google_accept_tos") {
                         Some(true) => true,
                         _ => false,
                     };
@@ -353,13 +341,16 @@ async fn main() {
                         }
                     });
 
-                    if email.is_none() || aas_token.is_none() {
+                    if email.is_none() || (aas_token.is_none() && auth_token.is_none()) {
                         if let Ok(conf) = load_config(ini_file) {
                             if email.is_none() {
                                 email = conf.get("google", "email");
                             }
-                            if aas_token.is_none() {
+                            if aas_token.is_none() && auth_token.is_none() {
                                 aas_token = conf.get("google", "aas_token");
+                                if aas_token.is_none() {
+                                    auth_token = conf.get("google", "auth_token");
+                                }
                             }
                         }
                     }
@@ -372,12 +363,18 @@ async fn main() {
                         email = Some(prompt_email.trim().to_string());
                     }
 
-                    if aas_token.is_none() {
-                        let mut prompt_aas_token = String::new();
-                        print!("AAS Token: ");
+                    if aas_token.is_none() && auth_token.is_none() {
+                        let mut prompt_token = String::new();
+                        print!("AAS Token (or AUTH Token): ");
                         io::stdout().flush().unwrap();
-                        io::stdin().read_line(&mut prompt_aas_token).unwrap();
-                        aas_token = Some(prompt_aas_token.trim().to_string());
+                        io::stdin().read_line(&mut prompt_token).unwrap();
+                        let token = prompt_token.trim().to_string();
+                        // Heuristic: AUTH tokens typically start with "ya29."
+                        if token.starts_with("ya29.") {
+                            auth_token = Some(token);
+                        } else {
+                            aas_token = Some(token);
+                        }
                     }
 
                     google_play::download_apps(
@@ -385,7 +382,8 @@ async fn main() {
                         parallel,
                         sleep_duration,
                         &email.unwrap(),
-                        &aas_token.unwrap(),
+                        aas_token.as_deref(),
+                        auth_token.as_deref(),
                         &outpath.unwrap(),
                         accept_tos,
                         options,
@@ -400,9 +398,6 @@ async fn main() {
                     &outpath.unwrap(),
                     options,
                 ).await;
-            }
-            DownloadSource::HuaweiAppGallery => {
-                huawei_app_gallery::download_apps(list, parallel, sleep_duration, &outpath.unwrap()).await;
             }
             DownloadSource::RuStore => {
                 rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap(), options).await;

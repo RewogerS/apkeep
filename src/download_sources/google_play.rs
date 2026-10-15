@@ -15,7 +15,8 @@ pub async fn download_apps(
     parallel: usize,
     sleep_duration: u64,
     email: &str,
-    aas_token: &str,
+    aas_token: Option<&str>,
+    auth_token: Option<&str>,
     outpath: &Path,
     accept_tos: bool,
     mut options: HashMap<&str, &str>,
@@ -33,8 +34,10 @@ pub async fn download_apps(
         Some(val) if val == "1" || val.to_lowercase() == "true" => true,
         _ => false,
     };
-    let mut gpa = Gpapi::new(device, email);
-
+    let mut gpa = match options.remove("device_properties_file") {
+        None => Gpapi::new(device, email),
+        Some(file) => Gpapi::from_device_properties_file(device, email, file)
+    };
     if let Some(locale) = options.remove("locale") {
         gpa.set_locale(locale);
     }
@@ -42,21 +45,25 @@ pub async fn download_apps(
         gpa.set_timezone(timezone);
     }
 
-    gpa.set_aas_token(aas_token);
+    // Set the appropriate token type
+    if let Some(aas) = aas_token {
+        gpa.set_aas_token(aas);
+    } else if let Some(auth) = auth_token {
+        gpa.set_auth_token(auth);
+    } else {
+        eprintln!("Either AAS token or AUTH token must be provided");
+        std::process::exit(1);
+    }
     if let Err(err) = gpa.login().await {
         match err.kind() {
             GpapiErrorKind::TermsOfService => {
                 if accept_tos {
                     match gpa.accept_tos().await {
                         Ok(_) => {
-                            if let Err(_) = gpa.login().await {
-                                eprintln!("Could not log in, even after accepting the Google Play Terms of Service");
-                                std::process::exit(1);
-                            }
                             println!("Google Play Terms of Service accepted.");
                         },
-                        _ => {
-                            eprintln!("Could not accept Google Play Terms of Service");
+                        Err(e) => {
+                            eprintln!("Could not accept Google Play Terms of Service: {}", e);
                             std::process::exit(1);
                         },
                     }
@@ -85,7 +92,7 @@ pub async fn download_apps(
 
             async move {
                 if app_version.is_none() {
-                    mp_log.suspend(|| println!("Downloading {}...", app_id));
+                    mp_log.suspend(|| println!("Downloading {} from Google Play...", app_id));
                     if sleep_duration > 0 {
                         sleep(TokioDuration::from_millis(sleep_duration)).await;
                     }
@@ -133,11 +140,15 @@ pub async fn request_aas_token(
     mut options: HashMap<&str, &str>,
 ) {
     let device = options.remove("device").unwrap_or("px_9a");
-    let mut api = Gpapi::new(device, email);
+    let mut api = match options.remove("device_properties_file") {
+        None => Gpapi::new(device, email),
+        Some(file) => Gpapi::from_device_properties_file(device, email, file)
+    };
     match api.request_aas_token(oauth_token).await {
         Ok(()) => {
             let aas_token = api.get_aas_token().unwrap();
-            println!("AAS Token: {}", aas_token);
+            eprintln!("AAS Token:");
+            println!("{}", aas_token);
         },
         Err(_) => {
             println!("Error: was not able to retrieve AAS token with the provided OAuth token. Please provide new OAuth token and try again.");
