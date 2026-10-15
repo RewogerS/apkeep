@@ -82,6 +82,9 @@ Or, to download from RuStore:
 apkeep -a com.vk.calls -d ru-store .
 ```
 
+For RuStore device/client options and its latest-only and split APK limitations,
+refer to [`USAGE-rustore.md`](USAGE-rustore.md).
+
 To download a specific version of an APK (possible for APKPure or F-Droid), use the `@version`
 convention:
 

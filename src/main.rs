@@ -68,6 +68,15 @@
 //! apkeep -a com.elysiumlabs.newsbytes -d huawei-app-gallery .
 //! ```
 //!
+//! Or, to download from RuStore:
+//!
+//! ```shell
+//! apkeep -a com.vk.calls -d ru-store .
+//! ```
+//!
+//! For RuStore device/client options and its latest-only and split APK limitations,
+//! refer to [`USAGE-rustore.md`](USAGE-rustore.md).
+//!
 //! To download a specific version of an APK (possible for APKPure or F-Droid), use the `@version`
 //! convention:
 //!
@@ -109,6 +118,7 @@
 //! verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
 //! was downloaded but could not be verified
 //! * The Huawei AppGallery (`-d huawei-app-gallery`), an app store popular in China
+//! * RuStore (`-d ru-store`), a Russian app store platform
 //!
 //! # Usage Note
 //!
@@ -395,7 +405,7 @@ async fn main() {
                 huawei_app_gallery::download_apps(list, parallel, sleep_duration, &outpath.unwrap()).await;
             }
             DownloadSource::RuStore => {
-                rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap()).await;
+                rustore::download_apps(list, parallel, sleep_duration, &outpath.unwrap(), options).await;
             }
         }
     }
