@@ -26,8 +26,13 @@ jobs:
         run: cargo +stable clippy --locked --all-targets
       - name: Build documentation
         run: cargo +stable doc --locked --no-deps
-      - name: Test release script without contacting remote hosts
-        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Shared downloader unit regressions
+        run: |
+          cargo test --locked -p tokio-dl-stream-to-disk --lib
+      - name: Release-script mocks and real credential PTY (no remote SSH/login)
+        env:
+          APKEEP_TEST_BINARY: target/debug/apkeep
+        run: python3 -B -m unittest discover -s tests
       - name: Validate release script syntax
         run: bash -n build-remote.sh
       - name: Check generated help is committed

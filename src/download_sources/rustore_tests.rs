@@ -2,6 +2,382 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+// Hold a real socket open after sending headers (and optionally initial body bytes).
+// The returned task owns the connection until explicitly cancelled by the test.
+async fn serve_held_response(prefix: String) -> (String, tokio::task::JoinHandle<()>) {
+    let (endpoint, task, _) = serve_counted_held_response(prefix).await;
+    (endpoint, task)
+}
+
+async fn serve_counted_held_response(
+    prefix: String,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/private?token=secret-token",
+        listener.local_addr().unwrap()
+    );
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let prefix = prefix.clone();
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                stream.write_all(prefix.as_bytes()).await.unwrap();
+                let mut byte = [0];
+                let _ = stream.read(&mut byte).await;
+            });
+        }
+    });
+    (endpoint, task, attempts)
+}
+
+async fn assert_apk_stall_is_bounded(prefix: &str, policy: NetworkPolicy, observe_partial: bool) {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
+    let download = tokio::time::timeout(
+        TokioDuration::from_millis(800),
+        download_apk_with_policy(
+            endpoint,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+            policy,
+        ),
+    );
+    let observer = async {
+        if observe_partial {
+            tokio::time::timeout(TokioDuration::from_millis(400), async {
+                loop {
+                    if std::fs::read_dir(out.path()).unwrap().any(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.metadata().ok())
+                            .is_some_and(|metadata| metadata.len() > 0)
+                    }) {
+                        break;
+                    }
+                    sleep(TokioDuration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("server's initial body chunk was not written to a temporary file");
+        }
+    };
+    let (result, ()) = tokio::join!(download, observer);
+    task.abort();
+    assert!(!result.expect("APK stall exceeded the injected deadline"));
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "retries must stop after three attempts"
+    );
+    assert_eq!(
+        std::fs::read_dir(out.path()).unwrap().count(),
+        0,
+        "APK or partial file leaked"
+    );
+}
+
+#[tokio::test]
+async fn apk_total_deadline_bounds_stalled_headers() {
+    assert_apk_stall_is_bounded(
+        "",
+        NetworkPolicy {
+            apk_total: TokioDuration::from_millis(60),
+            ..NetworkPolicy::default()
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_total_deadline_cleans_up_after_an_initial_body_chunk() {
+    assert_apk_stall_is_bounded(
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nsecret-partial-body",
+        NetworkPolicy {
+            apk_total: TokioDuration::from_millis(60),
+            ..NetworkPolicy::default()
+        },
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_idle_deadline_bounds_stalled_headers() {
+    assert_apk_stall_is_bounded(
+        "",
+        NetworkPolicy {
+            idle_read: TokioDuration::from_millis(60),
+            apk_total: TokioDuration::from_secs(5),
+            ..NetworkPolicy::default()
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_idle_deadline_cleans_up_after_an_initial_body_chunk() {
+    assert_apk_stall_is_bounded(
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nsecret-partial-body",
+        NetworkPolicy {
+            idle_read: TokioDuration::from_millis(60),
+            apk_total: TokioDuration::from_secs(5),
+            ..NetworkPolicy::default()
+        },
+        true,
+    )
+    .await;
+}
+
+async fn assert_apk_oversize_is_rejected_early(prefix: &str) {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(400),
+        download_apk_with_policy(
+            endpoint,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+            NetworkPolicy {
+                apk_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    assert!(!result.expect("oversized APK waited for body/EOF instead of rejecting early"));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn apk_declared_oversize_is_rejected_before_body() {
+    assert_apk_oversize_is_rejected_early("HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n").await;
+}
+
+#[tokio::test]
+async fn apk_streamed_oversize_is_rejected_before_eof() {
+    assert_apk_oversize_is_rejected_early(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nsecret-oversized!!\r\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn metadata_total_deadline_bounds_headers_and_partial_body() {
+    for prefix in [
+        "",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n[\r\n",
+    ] {
+        let (endpoint, task) = serve_held_response(prefix.into()).await;
+        let result = tokio::time::timeout(
+            TokioDuration::from_millis(400),
+            request_json_with_policy(
+                local_client().get(endpoint),
+                NetworkPolicy {
+                    metadata_total: TokioDuration::from_millis(50),
+                    ..NetworkPolicy::default()
+                },
+            ),
+        )
+        .await;
+        task.abort();
+        let error = result
+            .expect("metadata exceeded its total deadline")
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        for secret in ["secret", "http://", "127.0.0.1", "private", "token="] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+}
+
+#[test]
+fn production_network_limits_are_fixed_and_bounded() {
+    let policy = NetworkPolicy::default();
+    assert_eq!(policy.connect, TokioDuration::from_secs(15));
+    assert_eq!(policy.metadata_total, TokioDuration::from_secs(60));
+    assert_eq!(policy.metadata_max_bytes, 4 * 1024 * 1024);
+    assert_eq!(policy.apk_total, TokioDuration::from_secs(900));
+    assert_eq!(policy.idle_read, TokioDuration::from_secs(30));
+    assert_eq!(policy.apk_max_bytes, 2 * 1024 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn metadata_streamed_oversize_is_rejected_before_eof() {
+    let (endpoint, task) = serve_held_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nsecret-oversized!!\r\n".into(),
+    )
+    .await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(250),
+        request_json_with_policy(
+            local_client().get(endpoint),
+            NetworkPolicy {
+                metadata_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    let error = result
+        .expect("streamed metadata cap waited for EOF")
+        .unwrap_err();
+    assert!(error.contains("size limit"), "{error}");
+    assert!(!error.contains("secret"));
+}
+
+#[tokio::test]
+async fn metadata_declared_oversize_is_rejected_before_body() {
+    let (endpoint, task) =
+        serve_held_response("HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n".into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(250),
+        request_json(local_client().get(endpoint)),
+    )
+    .await;
+    task.abort();
+    let error = result
+        .expect("oversized metadata waited for its body")
+        .unwrap_err();
+    assert!(error.contains("size limit"), "{error}");
+    assert!(!error.contains("secret"));
+}
+
+#[tokio::test]
+async fn streamed_caps_accumulate_across_individually_small_chunks() {
+    let prefix =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n9\r\nsecret123\r\n";
+    let (endpoint, task) = serve_held_response(prefix.into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(400),
+        request_json_with_policy(
+            local_client().get(endpoint),
+            NetworkPolicy {
+                metadata_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    assert_eq!(
+        result
+            .expect("metadata cap was applied per chunk instead of cumulatively")
+            .unwrap_err(),
+        "RuStore metadata size limit exceeded"
+    );
+    assert_apk_oversize_is_rejected_early(prefix).await;
+}
+
+#[tokio::test]
+async fn exact_resource_caps_accept_complete_declared_and_streamed_bodies() {
+    let metadata = r#"{"ok":true}"#;
+    let apk = "0123456789abcdef";
+    for chunked in [false, true] {
+        let response = |body: &str| {
+            if chunked {
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            }
+        };
+        let (endpoint, task) = serve_raw_response(response(metadata)).await;
+        assert_eq!(
+            request_json_with_policy(
+                local_client().get(endpoint),
+                NetworkPolicy {
+                    metadata_max_bytes: metadata.len(),
+                    ..NetworkPolicy::default()
+                }
+            )
+            .await
+            .unwrap(),
+            json!({"ok":true})
+        );
+        task.await.unwrap();
+        let (endpoint, task) = serve_raw_response(response(apk)).await;
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            download_apk_with_policy(
+                endpoint,
+                "com.example.app".into(),
+                out.path(),
+                Rc::new(MultiProgress::new()),
+                NetworkPolicy {
+                    apk_max_bytes: apk.len() as u64,
+                    ..NetworkPolicy::default()
+                }
+            )
+            .await
+        );
+        task.await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("com.example.app.apk")).unwrap(),
+            apk.as_bytes()
+        );
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn network_policy_diagnostics_are_redacted_on_actual_stdout_and_stderr() {
+    for test in [
+        "apk_total_deadline_bounds_stalled_headers",
+        "apk_total_deadline_cleans_up_after_an_initial_body_chunk",
+        "apk_idle_deadline_bounds_stalled_headers",
+        "apk_idle_deadline_cleans_up_after_an_initial_body_chunk",
+        "apk_declared_oversize_is_rejected_before_body",
+        "apk_streamed_oversize_is_rejected_before_eof",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{}::{test}", module_path!().split_once("::").unwrap().1),
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{test}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(if test.contains("oversize") {
+                "size limit"
+            } else {
+                "timed out"
+            }),
+            "{test}: {stderr}"
+        );
+        assert_eq!(stderr.matches("(attempt ").count(), 3, "{test}: {stderr}");
+        assert!(
+            !stdout.contains("downloaded successfully"),
+            "{test}: {stdout}"
+        );
+        for secret in ["secret-", "http://", "127.0.0.1", "private?", "token="] {
+            assert!(!stdout.contains(secret), "{test}: {stdout}");
+            assert!(!stderr.contains(secret), "{test}: {stderr}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn apk_download_returns_its_actual_success() {
     let out = tempfile::tempdir().unwrap();

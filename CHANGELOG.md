@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+- Fail the CLI on APKPure, F-Droid and Google Play errors; preserve mixed-batch successes.
+- Publish shared downloads atomically without clobbering existing outputs, verify F-Droid SHA256 before publication, and discard failed Google Play staging directories.
+- Bound source metadata/download operations and expand loopback, cancellation, race and credential-terminal regressions.
+- Parse quoted CSV and reject missing selected columns; fail invalid explicit INI and hide interactive token input.
+- Replace the remote release provisioner with an exact-commit, pinned-host native-Linux build collector.
+- Replace the yanked zip 8.6.0 lock with zip 9.0.3; retain the documented full-Git-checkout packaging requirement.
 - Return nonzero when any RuStore download fails; reject zero parallelism before downloads or authentication.
 - Expand offline tests across CLI/input/config, RuStore, APKPure, F-Droid and Google Play listing.
 - Stop release artifact collection after failed SSH builds or SCP transfers; test with local command mocks.

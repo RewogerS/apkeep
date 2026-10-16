@@ -15,6 +15,7 @@ sha256sum = ["sha2"]
 futures-util = { version = "0.3", features = ["io"] }
 reqwest = { version = "0.13", features = ["stream"] }
 bytes = "1"
+tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }
 tokio = { version = "1", features = ["full"] }
 sha2 = { version = "0.11", optional = true }

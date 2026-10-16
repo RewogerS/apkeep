@@ -75,7 +75,7 @@ fn empty_rustore_batch_is_an_error() {
         "empty RuStore batch exited successfully"
     );
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("No RuStore apps to download"));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CSV contains no apps"));
 }
 
 #[test]

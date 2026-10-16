@@ -52,31 +52,29 @@ fn stdout(output: &Output) -> &str {
 }
 
 #[test]
-fn google_play_listing_is_latest_only_and_does_not_require_credentials_or_outpath() {
+fn google_play_listing_is_explicitly_unsupported_without_credentials_or_outpath() {
     let output = run(
         &["-d", "google-play", "-l", "-a", "com.example.fixture@1.2.3"],
         &[],
     );
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(stdout(&output), "Versions available for com.example.fixture on Google Play:\n| Google Play does not make old versions of apps available.\n");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not make old versions"));
 }
 
 #[test]
-fn google_play_csv_listing_preserves_order_without_login() {
+fn google_play_csv_listing_is_unsupported_without_login() {
     let output = run(
         &["-d", "google-play", "-l", "-c", "apps.csv", "-v", "2"],
         &[("apps.csv", "com.example.first,1\ncom.example.second,2\n")],
     );
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(stdout(&output), "Versions available for com.example.first on Google Play:\n| Google Play does not make old versions of apps available.\nVersions available for com.example.second on Google Play:\n| Google Play does not make old versions of apps available.\n");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not make old versions"));
 }
 
 #[test]
-fn google_play_listing_does_not_read_ini_or_apply_json_option() {
-    // Characterize current dispatch: listing is plaintext even with json option,
-    // and an invalid explicit INI is ignored because there is no login.
+fn google_play_unsupported_listing_never_prompts_or_logs_in() {
     let output = run(
         &[
             "-d",
@@ -91,9 +89,9 @@ fn google_play_listing_does_not_read_ini_or_apply_json_option() {
         ],
         &[],
     );
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(stdout(&output), "Versions available for com.example.fixture on Google Play:\n| Google Play does not make old versions of apps available.\n");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("does not make old versions"));
 }
 
 #[test]
@@ -136,10 +134,10 @@ fn google_play_invalid_explicit_ini_is_rejected_before_prompt_or_login() {
             &[],
         );
         assert_eq!(output.status.code(), Some(1));
-        assert!(stdout(&output).contains("Specified ini is not a valid file"));
+        assert!(output.stdout.is_empty());
         assert!(!stdout(&output).contains("Email:"));
         assert!(!stdout(&output).contains("AAS Token"));
-        assert!(output.stderr.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("configuration"));
     }
 }
 
@@ -152,9 +150,7 @@ fn google_play_oauth_missing_value_is_a_parser_error_not_a_login() {
 }
 
 #[test]
-fn google_play_oauth_list_currently_has_no_apps_and_never_logs_in() {
-    // OAuth suppresses app/CSV selection in main, even when -a is present.
-    // This is characterization of questionable CLI semantics, not endorsement.
+fn google_play_oauth_listing_is_rejected_not_silently_ignored() {
     let output = run(
         &[
             "--oauth-token",
@@ -167,9 +163,9 @@ fn google_play_oauth_list_currently_has_no_apps_and_never_logs_in() {
         ],
         &[],
     );
-    assert!(output.status.success());
+    assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    assert!(output.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("OAuth"));
 }
 
 #[test]

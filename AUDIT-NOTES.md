@@ -1,39 +1,56 @@
-# Repository inspection notes
+# Audit notes and remaining boundaries
 
-This is a bounded inspection of the fork based on `ddd6cf8`, not a statement
-that every path is safe. See [TESTING.md](TESTING.md) for reproducible local checks
-and the distinction between offline fixtures and live integrations.
+This checkout includes a second reliability pass after the original RuStore
+status/zero-parallel fixes. These are source changes, **not** a production rollout
+or a blanket security certification. Detailed contracts are in [RELIABILITY.md](RELIABILITY.md).
 
-## Follow-up work identified by the repository-wide inspection
+## Addressed in this branch
 
-These are inherited concerns, not regressions attributed to the RuStore status
-fix. Confirm against the current source before starting a follow-up change.
+- APKPure, F-Droid and Google Play callers return aggregate outcomes to main.
+  Any failed/invalid item produces a nonzero CLI exit; a mixed batch retains
+  successful outputs. Unsupported Google Play listing is explicitly unsuccessful.
+- The shared downloader stages privately, completes/flushes writes and publishes
+  without overwriting destination entries. Checksum-verified F-Droid downloads
+  are checked before publication. Error/cancellation/race regressions exercise
+  the actual vendored dependency as well as source callers.
+- Source/network deadlines bound work that previously had no explicit policy;
+  metadata paths have bounded reads. Timeouts are failures, not store absence.
+- Path components and metadata-derived names are checked. APKPure version
+  matching no longer borrows the URL of a following version record.
+- F-Droid repository/index/cache failures are propagated instead of panicking or
+  reporting a successful empty operation. Signed archives are reverified on cache
+  use rather than trusting an unsigned JSON cache across verification settings.
+- Google Play attempts use private per-attempt staging. Caller-policy tests cover
+  auth, Terms of Service, retries, deadlines and aggregate outcomes via the same
+  backend adapter as real calls, without credentials or accepting real ToS.
+- CSV uses a proper CSV reader plus explicit malformed-quote/selected-column
+  validation. Missing version columns cannot silently become `latest`.
+- An explicit Google Play INI must load even with complete CLI credentials.
+  Missing default INI remains optional. Token input is no-echo, non-TTY missing
+  credentials fail early, and invalid OAuth/list combinations fail explicitly.
+- The remote release script is now an exact-commit source/archive collector with
+  pinned SSH host keys and no provisioning or publishing. Local mocks execute
+  its remote payload and check the source/artifact identity contract.
+- `rustls` remains locked at 0.23.46. The yanked `zip` 8.6.0 lock is replaced with
+  9.0.3. Dependency audit reports, advisory database provenance and test logs are
+  retained outside the source checkout.
 
-| Area | Remaining concern | Consequence / recommended next step |
-|---|---|---|
-| Other source exit statuses | APKPure/F-Droid/Google Play still have paths which only print an item error instead of aggregating failure to the CLI | Do not treat exit 0 as an artifact-validity proof across all sources; apply the explicit batch result contract source by source |
-| APKPure/F-Droid/Google downloader dependency | Legacy callers still write directly to final names and may retry against partial files; the vendored patch now fixes short writes, missing flush and missing SHA stream initialization | A failed transfer can still leave a partial file; use temporary output, no-clobber publication, cleanup and integrity validation before web integration |
-| Input and output names | Legacy sources construct filenames from app/version/ABI values without a unified safe-component policy | Validate before requests and publication; test traversal, symlinks and races, including Windows separately |
-| APKPure metadata parsing | Broad version/URL regular expressions can cross record boundaries and lack a documented destination policy | Replace with fixture-backed structured parsing; never silently download another version under a pinned name |
-| F-Droid cache and network boundaries | Several expected network/cache/decode errors still panic or exit deep in helpers; the cache's verification/fingerprint policy needs separate review | Add bounded HTTP/cache tests and structured errors; do not weaken signature verification to make tests pass |
-| Shared input | CSV is split by commas, not a fully quoted CSV dialect; a missing version column can silently become latest | Define the input contract and reject incomplete records rather than silently changing requested version |
-| Google credentials | Interactive token input uses ordinary terminal echo; some explicit INI errors are ignored by dispatch | Add no-echo/fail-closed secret input and distinguish missing default config from malformed explicit config; no real credentials in tests |
-| HTTP availability | Several legacy clients lack explicit application timeouts/body caps | Add bounded per-stage request policies; a loopback fixture does not prove the public service cannot stall |
-| Generated help | `build.rs` writes tracked `USAGE` in the source checkout | Move generation into `OUT_DIR` and provide an explicit checked documentation update command; CI currently checks drift only |
-| Release reproducibility | The remote script still clones upstream EFForg instead of a supplied immutable fork commit, disables SSH host-key checking and bootstraps mutable artifacts | The error-stop regression is fixed separately, but this script is not a verified release pipeline for this fork; pin inputs and verify artifact hashes before use |
-| Dependencies | `bincode 2.0.1` via gpapi has a RustSec unmaintained warning, not a demonstrated vulnerability | Coordinate serializer migration with upstream; do not invent a patched version or break cache compatibility |
+## Not certified or not activated
 
-Some findings come from static inspection and explicitly labelled semantic
-reproductions, not a reproduced end-to-end exploit. Trusted local inputs,
-custom repository metadata and hostile network responses are different threat
-models; do not report them as equivalent. Signature verification alone does not
-establish publisher trust, and a skipped existing file has not been reverified.
+| Area | Remaining boundary |
+|---|---|
+| Google Play | No real Google login, token exchange, paid entitlement, download or live ToS acceptance. Adapter tests cannot prove gpapi still matches the live service. |
+| Public stores | Loopback fixtures cannot certify API availability, anti-bot behavior or that every real response variant is supported. Live checks are separately reported with exact binary hashes. |
+| F-Droid trust | Offline signed fixtures test the implementation, not the legitimacy of a chosen custom repository key. `verify-index=false` remains an explicit opt-out and must never be confused with verification. |
+| APKPure | Downloads still require `acknowledge_dangers=true`; metadata matching is not publisher-signature or APK-authenticity validation. |
+| Existing outputs | No overwrite is not a fresh validation of a file left by an older binary. Delete/revalidate old partials before treating them as trusted artifacts. |
+| Crash/resource limits | Normal async drop/cancellation is covered. SIGKILL, machine failure, filesystem durability, arbitrary disk exhaustion and atomic rollback of multiple artifacts are not globally guaranteed. |
+| Credentials | CLI token arguments remain visible to shell history/process inspection. Successful token-retrieval stdout is intentionally secret-bearing. The no-echo prompt/permission-restricted INI are preferable. |
+| Dependencies | `bincode` 2.0.1 is unmaintained (RUSTSEC-2025-0141), inherited through gpapi. This warning alone is not a demonstrated exploitable vulnerability. |
+| Registry package | Root `[patch.crates-io]` is effective for the complete Git checkout, not consumers of a published `.crate`. Registry publication needs a separately published dependency strategy. |
+| Platforms/releases | Only the local Linux checkout and mocked native-Linux release workflow are exercised. No actual remote builder, cross-compilation, other OS targets, Docker or signed build attestation is certified. |
+| Web/service | The separate web false-found candidate has its own tests. Neither that candidate nor these Rust changes replace active production files or binaries automatically. |
+| Static analysis | Clippy is run and warnings are retained/reviewed; a successful exit is not a claim of zero warnings. |
 
-## Review boundaries
-
-- Tests cover actual local Rust helpers, bounded HTTP fixtures and child CLI
-  behavior. A passing test suite is not a full security approval.
-- Google authentication, remote store compatibility, cross-platform releases and
-  web APK Downloader jobs require separate checks.
-- No accepted Terms of Service, public credentials, service restarts or production
-  binary replacement are part of running these tests.
+Author attribution, original licenses and MIT notices remain preserved, including
+EFF/gpapi attribution, the MIT downloader patch and Apache-2.0 rpassword patch.

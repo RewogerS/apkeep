@@ -180,20 +180,89 @@ async fn get_download_url_at(
     Ok(url.to_string())
 }
 
-async fn request_json(request: reqwest::RequestBuilder) -> Result<Value, String> {
-    // Do not format reqwest errors: they can contain URLs and signed query strings.
-    let response = request
-        .send()
-        .await
-        .map_err(|_| "RuStore network error while sending request".to_string())?;
-    if !response.status().is_success() {
-        return Err(format!("RuStore HTTP {}", response.status().as_u16()));
+// Fixed production limits; private typed injection keeps loopback tests fast without
+// adding environment knobs or configurable public endpoints.
+#[derive(Clone, Copy)]
+struct NetworkPolicy {
+    connect: TokioDuration,
+    metadata_total: TokioDuration,
+    metadata_max_bytes: usize,
+    apk_total: TokioDuration,
+    idle_read: TokioDuration,
+    apk_max_bytes: u64,
+}
+
+impl Default for NetworkPolicy {
+    fn default() -> Self {
+        Self {
+            connect: TokioDuration::from_secs(15),
+            metadata_total: TokioDuration::from_secs(60),
+            metadata_max_bytes: 4 * 1024 * 1024,
+            apk_total: TokioDuration::from_secs(15 * 60),
+            idle_read: TokioDuration::from_secs(30),
+            apk_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
     }
-    let body = response
-        .text()
-        .await
-        .map_err(|_| "RuStore network error while reading response".to_string())?;
-    serde_json::from_str(&body).map_err(|_| "RuStore malformed response: invalid JSON".to_string())
+}
+
+async fn request_json(request: reqwest::RequestBuilder) -> Result<Value, String> {
+    request_json_with_policy(request, NetworkPolicy::default()).await
+}
+
+fn network_client(
+    policy: NetworkPolicy,
+    total: TokioDuration,
+) -> Result<reqwest::Client, &'static str> {
+    reqwest::Client::builder()
+        .connect_timeout(policy.connect)
+        .read_timeout(policy.idle_read)
+        .timeout(total)
+        .build()
+        .map_err(|_| "RuStore could not initialize HTTP client")
+}
+
+async fn request_json_with_policy(
+    request: reqwest::RequestBuilder,
+    policy: NetworkPolicy,
+) -> Result<Value, String> {
+    // An outer deadline preserves any shorter timeout on an injected client.
+    // RequestBuilder::timeout would replace that deadline rather than cap it.
+    tokio::time::timeout(policy.metadata_total, async {
+        // Never format reqwest errors: URLs and signed query strings are untrusted.
+        let mut response = request.send().await.map_err(|error| {
+            if error.is_timeout() {
+                "RuStore network error: metadata request timed out".to_string()
+            } else {
+                "RuStore network error while sending request".to_string()
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(format!("RuStore HTTP {}", response.status().as_u16()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > policy.metadata_max_bytes as u64)
+        {
+            return Err("RuStore metadata size limit exceeded".to_string());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            if error.is_timeout() {
+                "RuStore network error: metadata request timed out".to_string()
+            } else {
+                "RuStore network error while reading response".to_string()
+            }
+        })? {
+            if chunk.len() > policy.metadata_max_bytes.saturating_sub(body.len()) {
+                return Err("RuStore metadata size limit exceeded".to_string());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        serde_json::from_slice(&body)
+            .map_err(|_| "RuStore malformed response: invalid JSON".to_string())
+    })
+    .await
+    .unwrap_or_else(|_| Err("RuStore network error: metadata request timed out".to_string()))
 }
 
 pub async fn download_apps(
@@ -256,7 +325,14 @@ async fn download_apps_at(
             return false;
         }
     };
-    let http_client = Rc::new(reqwest::Client::new());
+    let policy = NetworkPolicy::default();
+    let http_client = match network_client(policy, policy.metadata_total) {
+        Ok(client) => Rc::new(client),
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
 
     let mp = Rc::new(MultiProgress::new());
     let results = futures_util::stream::iter(apps.into_iter().map(|app| {
@@ -334,6 +410,23 @@ async fn download_apk(
     outpath: &Path,
     mp: Rc<MultiProgress>,
 ) -> bool {
+    download_apk_with_policy(
+        download_url,
+        app_string,
+        outpath,
+        mp,
+        NetworkPolicy::default(),
+    )
+    .await
+}
+
+async fn download_apk_with_policy(
+    download_url: String,
+    app_string: String,
+    outpath: &Path,
+    mp: Rc<MultiProgress>,
+    policy: NetworkPolicy,
+) -> bool {
     use tokio::io::AsyncWriteExt;
 
     if !valid_package_name(&app_string) {
@@ -360,15 +453,32 @@ async fn download_apk(
             return false;
         }
     }
-    let client = reqwest::Client::new();
+    let client = match network_client(policy, policy.apk_total) {
+        Ok(client) => client,
+        Err(error) => {
+            mp.suspend(|| eprintln!("{error}"));
+            return false;
+        }
+    };
     for attempt in 1..=3 {
-        let result = async {
+        let result = tokio::time::timeout(policy.apk_total, async {
             let mut response = client
                 .get(&download_url)
+                .timeout(policy.apk_total)
                 .send()
                 .await
                 .and_then(reqwest::Response::error_for_status)
-                .map_err(|_| "Invalid response")?;
+                .map_err(|error| {
+                    if error.is_timeout() {
+                        "RuStore APK request timed out"
+                    } else {
+                        "Invalid response"
+                    }
+                })?;
+            let expected_length = response.content_length();
+            if expected_length.is_some_and(|length| length > policy.apk_max_bytes) {
+                return Err("RuStore APK size limit exceeded");
+            }
             let temporary = tempfile::Builder::new()
                 .prefix(".apkeep-rustore-")
                 .tempfile_in(outpath)
@@ -378,25 +488,36 @@ async fn download_apk(
                     .reopen()
                     .map_err(|_| "Could not open download file")?,
             );
-            let cb = response
-                .content_length()
+            let cb = expected_length
                 .map(|length| progress_wrapper(Rc::clone(&mp))(fname.clone(), length));
-            let mut downloaded = 0;
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|_| "Could not read download")?
-            {
+            let mut downloaded = 0u64;
+            while let Some(chunk) = response.chunk().await.map_err(|error| {
+                if error.is_timeout() {
+                    "RuStore APK request timed out"
+                } else {
+                    "Could not read download"
+                }
+            })? {
+                let next_length = downloaded
+                    .checked_add(chunk.len() as u64)
+                    .filter(|length| *length <= policy.apk_max_bytes)
+                    .ok_or("RuStore APK size limit exceeded")?;
+                if expected_length.is_some_and(|length| next_length > length) {
+                    return Err("RuStore APK Content-Length mismatch");
+                }
                 file.write_all(&chunk)
                     .await
                     .map_err(|_| "Could not write download file")?;
-                downloaded += chunk.len() as u64;
+                downloaded = next_length;
                 if let Some(cb) = &cb {
                     cb(downloaded);
                 }
             }
             if downloaded == 0 {
                 return Err("Empty download response");
+            }
+            if expected_length.is_some_and(|length| downloaded != length) {
+                return Err("RuStore APK Content-Length mismatch");
             }
             file.flush()
                 .await
@@ -406,8 +527,9 @@ async fn download_apk(
                 .persist_noclobber(&destination)
                 .map_err(|_| "Could not publish download file")?;
             Ok::<(), &str>(())
-        }
-        .await;
+        })
+        .await
+        .unwrap_or(Err("RuStore APK request timed out"));
         match result {
             Ok(()) => {
                 mp.suspend(|| println!("{} downloaded successfully!", app_string));

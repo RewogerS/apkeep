@@ -1,10 +1,96 @@
-//! Characterization of shared input helpers; fixtures never contain real credentials.
+//! Shared input contracts; fixtures never contain real credentials.
+
+#[test]
+fn csv_explicit_empty_record_in_batch_is_error_not_a_blank_line() {
+    for (text, version) in [
+        ("com.example.app\n\"\"\n", None),
+        ("com.example.app,1\n\"\"\n", Some(2)),
+    ] {
+        assert!(parse_csv_text(text.into(), 1, version).is_err());
+    }
+}
+
+#[test]
+fn csv_selected_controls_are_rejected_and_bom_quoted_field_is_supported() {
+    for text in [
+        "\"com.example.app\nsecond\",1",
+        "com.example.app,\"1\n2\"",
+        "\tcom.example.app,1",
+    ] {
+        assert!(parse_csv_text(text.into(), 1, Some(2)).is_err());
+    }
+    assert_eq!(
+        parse_csv_text("\u{feff}\"com.example.app\",1".into(), 1, Some(2)).unwrap(),
+        vec![("com.example.app".into(), Some("1".into()))]
+    );
+}
+
+#[test]
+fn csv_malformed_quotes_cannot_silently_hide_batch_rows() {
+    for text in [
+        "com.example.app,1.2,\"unterminated\ncom.example.second,2",
+        "com.example.app,\"1.2\"junk",
+        "com.example.app,1\"2",
+    ] {
+        assert!(
+            parse_csv_text(text.to_owned(), 1, Some(2)).is_err(),
+            "malformed quoting accepted"
+        );
+    }
+    assert_eq!(
+        parse_csv_text(
+            "com.example.app,1.2,\"valid\nmultiline\"".into(),
+            1,
+            Some(2)
+        )
+        .unwrap(),
+        vec![("com.example.app".into(), Some("1.2".into()))]
+    );
+}
+
+#[test]
+fn csv_missing_requested_columns_is_an_error_not_latest_or_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("apps.csv");
+    for (text, field, version) in [("com.example.app\n", 1, Some(2)), ("only-one\n", 2, None)] {
+        fs::write(&file, text).unwrap();
+        assert!(
+            fetch_csv_list(file.to_str().unwrap(), field, version).is_err(),
+            "missing field accepted"
+        );
+    }
+}
+
+#[test]
+fn csv_quoted_unselected_field_and_escaped_quote_preserve_selected_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("apps.csv");
+    fs::write(
+        &file,
+        "\"label,with \"\"quotes\"\"\",com.example.app,1.2\r\n",
+    )
+    .unwrap();
+    assert_eq!(
+        fetch_csv_list(file.to_str().unwrap(), 2, Some(3)).unwrap(),
+        vec![("com.example.app".into(), Some("1.2".into()))]
+    );
+}
+
+#[test]
+fn csv_empty_app_and_empty_document_are_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("apps.csv");
+    for text in ["", "\n\r\n", ",1.2\n"] {
+        fs::write(&file, text).unwrap();
+        assert!(fetch_csv_list(file.to_str().unwrap(), 1, Some(2)).is_err());
+    }
+}
 use super::*;
 
 #[test]
 fn csv_single_column_handles_crlf_blank_rows_and_final_newline() {
     assert_eq!(
-        parse_csv_text("com.example.one\r\n\ncom.example.two\n".to_owned(), 1, None),
+        parse_csv_text("com.example.one\r\n\ncom.example.two\n".to_owned(), 1, None).unwrap(),
         vec![
             ("com.example.one".to_owned(), None),
             ("com.example.two".to_owned(), None)
@@ -15,11 +101,11 @@ fn csv_single_column_handles_crlf_blank_rows_and_final_newline() {
 #[test]
 fn csv_selects_app_and_version_columns_in_either_order() {
     assert_eq!(
-        parse_csv_text("label,com.example.one,1.2.3".to_owned(), 2, Some(3)),
+        parse_csv_text("label,com.example.one,1.2.3".to_owned(), 2, Some(3)).unwrap(),
         vec![("com.example.one".to_owned(), Some("1.2.3".to_owned()))]
     );
     assert_eq!(
-        parse_csv_text("1.2.3,label,com.example.one".to_owned(), 3, Some(1)),
+        parse_csv_text("1.2.3,label,com.example.one".to_owned(), 3, Some(1)).unwrap(),
         vec![("com.example.one".to_owned(), Some("1.2.3".to_owned()))]
     );
 }
@@ -27,7 +113,7 @@ fn csv_selects_app_and_version_columns_in_either_order() {
 #[test]
 fn csv_explicit_empty_version_means_latest() {
     assert_eq!(
-        parse_csv_text("com.example.one,".to_owned(), 1, Some(2)),
+        parse_csv_text("com.example.one,".to_owned(), 1, Some(2)).unwrap(),
         vec![("com.example.one".to_owned(), None)]
     );
 }

@@ -10,7 +10,9 @@ output/config directories and child-only environment changes.
 
 ```sh
 cargo test --locked --all-targets
+cargo test --locked -p tokio-dl-stream-to-disk --lib
 cargo build --locked
+APKEEP_TEST_BINARY=target/debug/apkeep python3 -B -m unittest discover -s tests
 cargo clippy --locked --all-targets
 cargo doc --locked --no-deps
 bash -n build-remote.sh
@@ -25,7 +27,9 @@ The GitHub Tests workflow runs tests, clippy, documentation and release-script
 syntax checks, then verifies that the generated `USAGE` file remains unchanged.
 Clippy warnings inherited from upstream are reported, not claimed absent. New
 warnings must be reviewed against a clean baseline. Do not execute
-`build-remote.sh` as a test: it installs packages and publishes release artifacts.
+`build-remote.sh` against a real host as a test. Its replacement is an exact-source
+native build collector, not a provisioning or publishing script. The Python
+release tests mock every transport/toolchain action; no SSH is performed.
 
 ## Test strategy
 
@@ -40,6 +44,14 @@ warnings must be reviewed against a clean baseline. Do not execute
 - Bug fixes need a regression which fails on the original behavior and passes
   after the fix. Characterization tests of existing behavior are identified as
   such, not called RED/GREEN evidence.
+
+## Reliability follow-up
+
+See [RELIABILITY.md](RELIABILITY.md) for batch status, atomic publication, deadlines,
+CSV and credential contracts. Google Play caller policy is exercised through the
+same bounded backend adapter as the real gpapi caller, with no Google login. The
+POSIX terminal test uses a real PTY and a deliberately invalid synthetic token;
+it asserts no-echo, terminal restoration and refusal before authentication.
 
 ## Shared downloader dependency
 
