@@ -747,7 +747,23 @@ fn verify_and_return_json(
             .signers()
             .next()
             .ok_or_else(|| SimpleError::new("No F-Droid signer."))?;
-        signer_info.verify_signature_with_signed_data_and_content(&signed_data, &signed_content)?;
+        if let Some(attributes) = signer_info.signed_attributes() {
+            if attributes.content_type()
+                != &cryptographic_message_syntax::asn1::rfc5652::OID_ID_DATA
+            {
+                return Err(Box::new(SimpleError::new(
+                    "Invalid F-Droid CMS signed content type.",
+                )));
+            }
+            // With signedAttrs the signature covers their DER encoding, not .SF.
+            signer_info.verify_signature_with_signed_data(&signed_data)?;
+            // Signature verification alone does not bind those attributes to .SF.
+            signer_info.verify_message_digest_with_content(&signed_content)?;
+        } else {
+            // Detached CMS without attributes signs the external .SF directly.
+            signer_info
+                .verify_signature_with_signed_data_and_content(&signed_data, &signed_content)?;
+        }
         let cert = signed_data
             .certificates()
             .next()
@@ -1041,7 +1057,15 @@ fn get_signed_data_from_cert_file(
     signature_block_file: PathBuf,
 ) -> Result<SignedData, Box<dyn Error>> {
     let bytes = fs::read(signature_block_file)?;
-    match SignedData::parse_ber(&bytes) {
+    // The high-level SignedData discards eContentType. Require JAR's id-data
+    // before conversion, including the no-signedAttrs case (RFC 5652 5.3).
+    let raw = cryptographic_message_syntax::asn1::rfc5652::SignedData::decode_ber(&bytes)?;
+    if raw.content_info.content_type != cryptographic_message_syntax::asn1::rfc5652::OID_ID_DATA {
+        return Err(Box::new(SimpleError::new(
+            "Invalid F-Droid CMS content type.",
+        )));
+    }
+    match SignedData::try_from(&raw) {
         Ok(signed_data) => {
             let certificates: Vec<&CapturedX509Certificate> = signed_data.certificates().collect();
             if certificates.len() > 1 {

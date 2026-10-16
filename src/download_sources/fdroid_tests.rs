@@ -43,6 +43,197 @@ fn signed_fixture_verifies_real_signature_pin_and_both_digest_chains() {
     }
 }
 
+fn signed_attributes_fixture(cms: &[u8]) -> (TempDir, Vec<String>, Vec<u8>) {
+    let (dir, files, _) = signed_fixture();
+    fs::write(dir.path().join(&files[0]), cms).unwrap();
+    let pin = hex::decode(include_str!("fixtures/fdroid-cms/fingerprint.txt").trim()).unwrap();
+    (dir, files, pin)
+}
+
+const ATTRS_CMS: &[u8] = include_bytes!("fixtures/fdroid-cms/attrs-detached.der");
+
+#[test]
+fn cms_signed_attributes_verify_detached_sf_and_both_digest_chains() {
+    let (dir, files, pin) = signed_attributes_fixture(ATTRS_CMS);
+    let data = get_signed_data_from_cert_file(dir.path().join(&files[0])).unwrap();
+    assert!(data.signed_content().is_none(), "fixture must be detached");
+    assert!(data.signers().next().unwrap().signed_attributes().is_some());
+    for entry in [true, false] {
+        assert_eq!(
+            verify_and_return_json(&dir, &files, &pin, true, entry, progress()).unwrap(),
+            "{}"
+        );
+    }
+}
+
+#[test]
+fn cms_rejects_non_data_content_types_with_or_without_signed_attributes() {
+    for cms in [
+        include_bytes!("fixtures/fdroid-cms/attrs-wrong-type.der").as_slice(),
+        include_bytes!("fixtures/fdroid-cms/noattrs-wrong-type.der").as_slice(),
+    ] {
+        let (dir, files, pin) = signed_attributes_fixture(cms);
+        let err = verify_and_return_json(&dir, &files, &pin, true, false, progress())
+            .expect_err("JAR signatures require id-data content");
+        assert!(err.to_string().contains("content type"), "{err}");
+    }
+}
+
+#[test]
+fn cms_rejects_signed_attribute_content_type_mismatching_id_data() {
+    // eContentType is not signed: restore only the first inner signed-data OID
+    // to id-data, leaving the valid signature over the wrong attribute intact.
+    let mut cms = include_bytes!("fixtures/fdroid-cms/attrs-wrong-type.der").to_vec();
+    let oid = [0x06, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 7, 2];
+    let offset = cms
+        .windows(oid.len())
+        .enumerate()
+        .filter(|(_, bytes)| *bytes == oid)
+        .nth(1)
+        .unwrap()
+        .0;
+    cms[offset + oid.len() - 1] = 1;
+    let parsed = SignedData::parse_ber(&cms).unwrap();
+    let signer = parsed.signers().next().unwrap();
+    signer.verify_signature_with_signed_data(&parsed).unwrap();
+    signer
+        .verify_message_digest_with_content(SIGNED_FILE.as_bytes())
+        .unwrap();
+    let (dir, files, pin) = signed_attributes_fixture(&cms);
+    let err = verify_and_return_json(&dir, &files, &pin, true, false, progress()).unwrap_err();
+    assert!(err.to_string().contains("content type"), "{err}");
+}
+
+#[test]
+fn cms_signed_attributes_reject_tampered_sf_even_with_a_valid_attribute_signature() {
+    let (dir, files, pin) = signed_attributes_fixture(ATTRS_CMS);
+    let altered = SIGNED_FILE.replace("Signature-Version: 1.0", "Signature-Version: 9.9");
+    fs::write(dir.path().join("META-INF/FIXTURE.SF"), altered).unwrap();
+    let data = get_signed_data_from_cert_file(dir.path().join(&files[0])).unwrap();
+    data.signers()
+        .next()
+        .unwrap()
+        .verify_signature_with_signed_data(&data)
+        .unwrap();
+    for entry in [true, false] {
+        let err = verify_and_return_json(&dir, &files, &pin, true, entry, progress()).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<cryptographic_message_syntax::CmsError>(),
+                Some(cryptographic_message_syntax::CmsError::DigestNotEqual)
+            ),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn cms_embedded_content_cannot_replace_the_external_sf_digest_binding() {
+    let cms = include_bytes!("fixtures/fdroid-cms/attrs-embedded-other.der");
+    let (dir, files, pin) = signed_attributes_fixture(cms);
+    let data = get_signed_data_from_cert_file(dir.path().join(&files[0])).unwrap();
+    let signer = data.signers().next().unwrap();
+    signer.verify_signature_with_signed_data(&data).unwrap();
+    signer
+        .verify_message_digest_with_signed_data(&data)
+        .unwrap();
+    let err = verify_and_return_json(&dir, &files, &pin, true, false, progress()).unwrap_err();
+    assert!(
+        matches!(
+            err.downcast_ref::<cryptographic_message_syntax::CmsError>(),
+            Some(cryptographic_message_syntax::CmsError::DigestNotEqual)
+        ),
+        "{err}"
+    );
+    // The same CMS is valid when external .SF matches what was actually signed.
+    fs::write(
+        dir.path().join("META-INF/FIXTURE.SF"),
+        data.signed_content().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        verify_and_return_json(&dir, &files, &pin, true, false, progress()).unwrap(),
+        "{}"
+    );
+}
+
+#[test]
+fn cms_signed_attributes_reject_tampered_signature_or_message_digest_attribute() {
+    let parsed = SignedData::parse_ber(ATTRS_CMS).unwrap();
+    let signer = parsed.signers().next().unwrap();
+    for signed_bytes in [
+        signer.signature(),
+        signer.signed_attributes().unwrap().message_digest(),
+    ] {
+        let mut cms = ATTRS_CMS.to_vec();
+        let offset = cms
+            .windows(signed_bytes.len())
+            .position(|bytes| bytes == signed_bytes)
+            .unwrap();
+        cms[offset] ^= 1;
+        let (dir, files, pin) = signed_attributes_fixture(&cms);
+        let err = verify_and_return_json(&dir, &files, &pin, true, false, progress()).unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<cryptographic_message_syntax::CmsError>(),
+                Some(cryptographic_message_syntax::CmsError::SignatureVerificationError)
+            ),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn cms_signed_attributes_require_content_type_and_message_digest_attributes() {
+    // Rename each mandatory attribute OID without changing the DER lengths.
+    for attribute in [3, 4] {
+        let oid = [0x06, 9, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 1, 9, attribute];
+        let mut cms = ATTRS_CMS.to_vec();
+        let offset = cms
+            .windows(oid.len())
+            .position(|bytes| bytes == oid)
+            .unwrap();
+        cms[offset + oid.len() - 1] = 99;
+        let (dir, files, pin) = signed_attributes_fixture(&cms);
+        assert!(verify_and_return_json(&dir, &files, &pin, true, false, progress()).is_err());
+    }
+}
+
+#[test]
+fn cms_signed_attributes_preserve_pin_manifest_and_index_checks() {
+    for entry in [true, false] {
+        for tamper in ["pin", "manifest", "index"] {
+            let (dir, files, mut pin) = signed_attributes_fixture(ATTRS_CMS);
+            let expected = match tamper {
+                "pin" => {
+                    pin[0] ^= 1;
+                    "Fingerprint"
+                }
+                "manifest" => {
+                    fs::write(
+                        dir.path().join("META-INF/MANIFEST.MF"),
+                        format!("{MANIFEST}tampered"),
+                    )
+                    .unwrap();
+                    "from the signed file does not match"
+                }
+                _ => {
+                    fs::write(
+                        dir.path()
+                            .join(if entry { "entry.json" } else { "index-v1.json" }),
+                        "{\"tampered\":true}",
+                    )
+                    .unwrap();
+                    "from the manifest file does not match"
+                }
+            };
+            let err =
+                verify_and_return_json(&dir, &files, &pin, true, entry, progress()).unwrap_err();
+            assert!(err.to_string().contains(expected), "{tamper}: {err}");
+        }
+    }
+}
+
 #[test]
 fn verifier_rejects_missing_or_multiple_signature_blocks() {
     let dir = tempdir().unwrap();
