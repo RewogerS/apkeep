@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install stable Rust and clippy
-        run: rustup update stable --profile minimal --component clippy
+        run: rustup toolchain install stable --profile minimal --component clippy
       - name: Test every target
         run: cargo +stable test --locked --all-targets
       - name: Lint every target
