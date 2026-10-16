@@ -2,6 +2,814 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+// Hold a real socket open after sending headers (and optionally initial body bytes).
+// The returned task owns the connection until explicitly cancelled by the test.
+async fn serve_held_response(prefix: String) -> (String, tokio::task::JoinHandle<()>) {
+    let (endpoint, task, _) = serve_counted_held_response(prefix).await;
+    (endpoint, task)
+}
+
+async fn serve_counted_held_response(
+    prefix: String,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!(
+        "http://{}/private?token=secret-token",
+        listener.local_addr().unwrap()
+    );
+    let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = attempts.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let prefix = prefix.clone();
+            tokio::spawn(async move {
+                read_request(&mut stream).await;
+                stream.write_all(prefix.as_bytes()).await.unwrap();
+                let mut byte = [0];
+                let _ = stream.read(&mut byte).await;
+            });
+        }
+    });
+    (endpoint, task, attempts)
+}
+
+async fn assert_apk_stall_is_bounded(prefix: &str, policy: NetworkPolicy, observe_partial: bool) {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
+    let download = tokio::time::timeout(
+        TokioDuration::from_millis(800),
+        download_apk_with_policy(
+            endpoint,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+            policy,
+        ),
+    );
+    let observer = async {
+        if observe_partial {
+            tokio::time::timeout(TokioDuration::from_millis(400), async {
+                loop {
+                    if std::fs::read_dir(out.path()).unwrap().any(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.metadata().ok())
+                            .is_some_and(|metadata| metadata.len() > 0)
+                    }) {
+                        break;
+                    }
+                    sleep(TokioDuration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("server's initial body chunk was not written to a temporary file");
+        }
+    };
+    let (result, ()) = tokio::join!(download, observer);
+    task.abort();
+    assert!(!result.expect("APK stall exceeded the injected deadline"));
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        3,
+        "retries must stop after three attempts"
+    );
+    assert_eq!(
+        std::fs::read_dir(out.path()).unwrap().count(),
+        0,
+        "APK or partial file leaked"
+    );
+}
+
+#[tokio::test]
+async fn apk_total_deadline_bounds_stalled_headers() {
+    assert_apk_stall_is_bounded(
+        "",
+        NetworkPolicy {
+            apk_total: TokioDuration::from_millis(60),
+            ..NetworkPolicy::default()
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_total_deadline_cleans_up_after_an_initial_body_chunk() {
+    assert_apk_stall_is_bounded(
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nsecret-partial-body",
+        NetworkPolicy {
+            apk_total: TokioDuration::from_millis(60),
+            ..NetworkPolicy::default()
+        },
+        true,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_idle_deadline_bounds_stalled_headers() {
+    assert_apk_stall_is_bounded(
+        "",
+        NetworkPolicy {
+            idle_read: TokioDuration::from_millis(60),
+            apk_total: TokioDuration::from_secs(5),
+            ..NetworkPolicy::default()
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn apk_idle_deadline_cleans_up_after_an_initial_body_chunk() {
+    assert_apk_stall_is_bounded(
+        "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nsecret-partial-body",
+        NetworkPolicy {
+            idle_read: TokioDuration::from_millis(60),
+            apk_total: TokioDuration::from_secs(5),
+            ..NetworkPolicy::default()
+        },
+        true,
+    )
+    .await;
+}
+
+async fn assert_apk_oversize_is_rejected_early(prefix: &str) {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(400),
+        download_apk_with_policy(
+            endpoint,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+            NetworkPolicy {
+                apk_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    assert!(!result.expect("oversized APK waited for body/EOF instead of rejecting early"));
+    assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn apk_declared_oversize_is_rejected_before_body() {
+    assert_apk_oversize_is_rejected_early("HTTP/1.1 200 OK\r\nContent-Length: 17\r\n\r\n").await;
+}
+
+#[tokio::test]
+async fn apk_streamed_oversize_is_rejected_before_eof() {
+    assert_apk_oversize_is_rejected_early(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nsecret-oversized!!\r\n",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn metadata_total_deadline_bounds_headers_and_partial_body() {
+    for prefix in [
+        "",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\n[\r\n",
+    ] {
+        let (endpoint, task) = serve_held_response(prefix.into()).await;
+        let result = tokio::time::timeout(
+            TokioDuration::from_millis(400),
+            request_json_with_policy(
+                local_client().get(endpoint),
+                NetworkPolicy {
+                    metadata_total: TokioDuration::from_millis(50),
+                    ..NetworkPolicy::default()
+                },
+            ),
+        )
+        .await;
+        task.abort();
+        let error = result
+            .expect("metadata exceeded its total deadline")
+            .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+        for secret in ["secret", "http://", "127.0.0.1", "private", "token="] {
+            assert!(!error.contains(secret), "{error}");
+        }
+    }
+}
+
+#[test]
+fn production_network_limits_are_fixed_and_bounded() {
+    let policy = NetworkPolicy::default();
+    assert_eq!(policy.connect, TokioDuration::from_secs(15));
+    assert_eq!(policy.metadata_total, TokioDuration::from_secs(60));
+    assert_eq!(policy.metadata_max_bytes, 4 * 1024 * 1024);
+    assert_eq!(policy.apk_total, TokioDuration::from_secs(900));
+    assert_eq!(policy.idle_read, TokioDuration::from_secs(30));
+    assert_eq!(policy.apk_max_bytes, 2 * 1024 * 1024 * 1024);
+}
+
+#[tokio::test]
+async fn metadata_streamed_oversize_is_rejected_before_eof() {
+    let (endpoint, task) = serve_held_response(
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n12\r\nsecret-oversized!!\r\n".into(),
+    )
+    .await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(250),
+        request_json_with_policy(
+            local_client().get(endpoint),
+            NetworkPolicy {
+                metadata_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    let error = result
+        .expect("streamed metadata cap waited for EOF")
+        .unwrap_err();
+    assert!(error.contains("size limit"), "{error}");
+    assert!(!error.contains("secret"));
+}
+
+#[tokio::test]
+async fn metadata_declared_oversize_is_rejected_before_body() {
+    let (endpoint, task) =
+        serve_held_response("HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n".into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(250),
+        request_json(local_client().get(endpoint)),
+    )
+    .await;
+    task.abort();
+    let error = result
+        .expect("oversized metadata waited for its body")
+        .unwrap_err();
+    assert!(error.contains("size limit"), "{error}");
+    assert!(!error.contains("secret"));
+}
+
+#[tokio::test]
+async fn streamed_caps_accumulate_across_individually_small_chunks() {
+    let prefix =
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n8\r\n12345678\r\n9\r\nsecret123\r\n";
+    let (endpoint, task) = serve_held_response(prefix.into()).await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(400),
+        request_json_with_policy(
+            local_client().get(endpoint),
+            NetworkPolicy {
+                metadata_max_bytes: 16,
+                ..NetworkPolicy::default()
+            },
+        ),
+    )
+    .await;
+    task.abort();
+    assert_eq!(
+        result
+            .expect("metadata cap was applied per chunk instead of cumulatively")
+            .unwrap_err(),
+        "RuStore metadata size limit exceeded"
+    );
+    assert_apk_oversize_is_rejected_early(prefix).await;
+}
+
+#[tokio::test]
+async fn exact_resource_caps_accept_complete_declared_and_streamed_bodies() {
+    let metadata = r#"{"ok":true}"#;
+    let apk = "0123456789abcdef";
+    for chunked in [false, true] {
+        let response = |body: &str| {
+            if chunked {
+                format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len())
+            } else {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+            }
+        };
+        let (endpoint, task) = serve_raw_response(response(metadata)).await;
+        assert_eq!(
+            request_json_with_policy(
+                local_client().get(endpoint),
+                NetworkPolicy {
+                    metadata_max_bytes: metadata.len(),
+                    ..NetworkPolicy::default()
+                }
+            )
+            .await
+            .unwrap(),
+            json!({"ok":true})
+        );
+        task.await.unwrap();
+        let (endpoint, task) = serve_raw_response(response(apk)).await;
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            download_apk_with_policy(
+                endpoint,
+                "com.example.app".into(),
+                out.path(),
+                Rc::new(MultiProgress::new()),
+                NetworkPolicy {
+                    apk_max_bytes: apk.len() as u64,
+                    ..NetworkPolicy::default()
+                }
+            )
+            .await
+        );
+        task.await.unwrap();
+        assert_eq!(
+            std::fs::read(out.path().join("com.example.app.apk")).unwrap(),
+            apk.as_bytes()
+        );
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn network_policy_diagnostics_are_redacted_on_actual_stdout_and_stderr() {
+    for test in [
+        "apk_total_deadline_bounds_stalled_headers",
+        "apk_total_deadline_cleans_up_after_an_initial_body_chunk",
+        "apk_idle_deadline_bounds_stalled_headers",
+        "apk_idle_deadline_cleans_up_after_an_initial_body_chunk",
+        "apk_declared_oversize_is_rejected_before_body",
+        "apk_streamed_oversize_is_rejected_before_eof",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("{}::{test}", module_path!().split_once("::").unwrap().1),
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{test}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains(if test.contains("oversize") {
+                "size limit"
+            } else {
+                "timed out"
+            }),
+            "{test}: {stderr}"
+        );
+        assert_eq!(stderr.matches("(attempt ").count(), 3, "{test}: {stderr}");
+        assert!(
+            !stdout.contains("downloaded successfully"),
+            "{test}: {stdout}"
+        );
+        for secret in ["secret-", "http://", "127.0.0.1", "private?", "token="] {
+            assert!(!stdout.contains(secret), "{test}: {stdout}");
+            assert!(!stderr.contains(secret), "{test}: {stderr}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn apk_download_returns_its_actual_success() {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task) = serve_once("200 OK", "test-apk-bytes").await;
+    let result = download_apk(
+        endpoint,
+        "com.example.app".to_string(),
+        out.path(),
+        Rc::new(MultiProgress::new()),
+    )
+    .await;
+    task.await.unwrap();
+    assert_eq!(
+        tokio::fs::read(out.path().join("com.example.app.apk"))
+            .await
+            .unwrap(),
+        b"test-apk-bytes"
+    );
+    assert!(result, "downloader discarded its success status");
+}
+
+#[tokio::test]
+async fn batch_reports_failed_apk_transfer() {
+    let out = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let failed_url = format!(
+        "http://{}/private.apk?token=secret-token",
+        listener.local_addr().unwrap()
+    );
+    drop(listener);
+    let (lookup, lookup_task) = serve_once("200 OK", r#"[{"id":42}]"#).await;
+    let (link, link_task) = serve_once(
+        "200 OK",
+        &json!({"code":"OK", "body":{"downloadUrls":[{"url":failed_url}]}}).to_string(),
+    )
+    .await;
+    let result = tokio::time::timeout(
+        TokioDuration::from_secs(5),
+        download_apps_at(
+            vec![("com.example.app".into(), None)],
+            1,
+            0,
+            out.path(),
+            HashMap::from([("rustore_version", "11500")]),
+            (&lookup, &link),
+        ),
+    )
+    .await
+    .unwrap();
+    lookup_task.await.unwrap();
+    link_task.await.unwrap();
+    assert!(!result, "batch discarded a failed APK transfer status");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn unsafe_package_cannot_escape_the_output_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let out = root.path().join("output");
+    std::fs::create_dir(&out).unwrap();
+    let (endpoint, task) = serve_once("200 OK", "test-apk-bytes").await;
+    let result = download_apk(
+        endpoint,
+        "../escaped".into(),
+        &out,
+        Rc::new(MultiProgress::new()),
+    )
+    .await;
+    // If validation rejects before I/O, the unused loopback server is cancelled.
+    task.abort();
+    assert!(
+        !root.path().join("escaped.apk").exists(),
+        "RuStore wrote outside OUTPATH"
+    );
+    assert!(!result, "RuStore accepted an unsafe package name");
+    assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+}
+
+#[test]
+fn loopback_batches_preserve_results_files_and_safe_output() {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    for scenario in [
+        "success",
+        "transfer-failure",
+        "mixed-serial",
+        "mixed-parallel",
+        "truncated",
+        "retry",
+        "lookup-failure",
+        "link-failure",
+    ] {
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!(
+                    "{}::loopback_batch_fixture",
+                    module_path!().split_once("::").unwrap().1
+                ),
+                "--nocapture",
+            ])
+            .env("APKEEP_TEST_RUSTORE_BATCH", scenario)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("loopback scenario {scenario} timed out");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{scenario}: {stdout}\n{stderr}");
+        let success = matches!(scenario, "success" | "retry");
+        assert!(
+            stdout.contains(&format!("BATCH_RESULT={success}")),
+            "{scenario}: {stdout}"
+        );
+        for secret in ["secret-", "http://", "127.0.0.1", "private.apk", "token="] {
+            assert!(
+                !stderr.contains(secret),
+                "unsafe stderr for {scenario}: {stderr}"
+            );
+            assert!(
+                !stdout.contains(secret),
+                "unsafe stdout for {scenario}: {stdout}"
+            );
+        }
+        if scenario == "success" {
+            assert!(stderr.is_empty(), "{scenario}: {stderr}");
+        } else {
+            assert!(
+                !stderr.is_empty(),
+                "{scenario}: failure missing from stderr"
+            );
+        }
+        if scenario.contains("mixed") {
+            assert!(
+                stdout.contains("com.example.good downloaded successfully!"),
+                "{stdout}"
+            );
+            assert!(
+                stdout.contains("com.example.last downloaded successfully!"),
+                "{stdout}"
+            );
+        }
+        assert!(!stderr.contains("downloaded successfully"));
+        assert!(!stdout.contains("Could not"));
+        assert!(!stdout.contains("Invalid response"));
+    }
+}
+
+// Invoked by the parent test in a separate process, so stdout/stderr are observed
+// without global environment mutation or any production endpoint override.
+#[tokio::test]
+async fn loopback_batch_fixture() {
+    let Ok(scenario) = std::env::var("APKEEP_TEST_RUSTORE_BATCH") else {
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server_base = base.clone();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server_seen = seen.clone();
+    let retry = scenario == "retry";
+    let task = tokio::spawn(async move {
+        let mut retries = 0;
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let target = request
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .nth(1)
+                .unwrap();
+            server_seen.lock().unwrap().push(target.to_string());
+            let (status, body, truncated) = if target.starts_with("/lookup") {
+                let body = if target.contains("missing") {
+                    "[]"
+                } else if target.contains("denied") {
+                    r#"[{"id":3}]"#
+                } else if target.contains("fail") {
+                    r#"[{"id":2}]"#
+                } else if target.contains("truncated") {
+                    r#"[{"id":4}]"#
+                } else {
+                    r#"[{"id":1}]"#
+                };
+                ("200 OK", body.to_string(), false)
+            } else if target == "/link" {
+                let body: Value =
+                    serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+                let id = body["appId"].as_u64().unwrap();
+                if id == 3 {
+                    (
+                        "200 OK",
+                        r#"{"code":"DENIED","body":"secret-api-response"}"#.to_string(),
+                        false,
+                    )
+                } else {
+                    ("200 OK", json!({"code":"OK","body":{"downloadUrls":[{"url":format!("{server_base}/apk/{id}/private.apk?token=secret-token")}]}}).to_string(), false)
+                }
+            } else if target.starts_with("/apk/2/") {
+                (
+                    "503 Service Unavailable",
+                    "secret-error-body".to_string(),
+                    false,
+                )
+            } else if target.starts_with("/apk/4/") {
+                retries += 1;
+                if retry && retries > 1 {
+                    ("200 OK", "complete-retry-apk".to_string(), false)
+                } else {
+                    ("200 OK", "secret-truncated-body".to_string(), true)
+                }
+            } else {
+                ("200 OK", "complete-test-apk".to_string(), false)
+            };
+            let length = if truncated {
+                body.len() + 100
+            } else {
+                body.len()
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n{body}"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    let out = tempfile::tempdir().unwrap();
+    let packages = match scenario.as_str() {
+        "success" => vec![("com.example.good", None)],
+        "transfer-failure" => vec![("com.example.fail", None)],
+        "truncated" | "retry" => vec![("com.example.truncated", None)],
+        "lookup-failure" => vec![("com.example.missing", None)],
+        "link-failure" => vec![("com.example.denied", None)],
+        _ => vec![
+            ("com.example.fail", None),
+            ("com.example.good", None),
+            ("com.example.missing", None),
+            ("com.example.denied", None),
+            ("com.example.pinned", Some("1")),
+            ("../unsafe", None),
+            ("com.example.last", None),
+        ],
+    };
+    let result = download_apps_at(
+        packages
+            .into_iter()
+            .map(|(id, version)| (id.into(), version.map(String::from)))
+            .collect(),
+        if scenario == "mixed-parallel" { 3 } else { 1 },
+        0,
+        out.path(),
+        HashMap::from([("rustore_version", "11500")]),
+        (&format!("{base}/lookup"), &format!("{base}/link")),
+    )
+    .await;
+    println!("BATCH_RESULT={result}");
+    let mut files = std::fs::read_dir(out.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    files.sort();
+    let expected = match scenario.as_str() {
+        "success" => vec!["com.example.good.apk"],
+        "retry" => vec!["com.example.truncated.apk"],
+        "mixed-serial" | "mixed-parallel" => vec!["com.example.good.apk", "com.example.last.apk"],
+        _ => vec![],
+    };
+    assert_eq!(files, expected, "unexpected files or partial leftovers");
+    for name in expected {
+        let bytes = std::fs::read(out.path().join(name)).unwrap();
+        assert_eq!(
+            bytes,
+            if scenario == "retry" {
+                b"complete-retry-apk".as_slice()
+            } else {
+                b"complete-test-apk".as_slice()
+            }
+        );
+    }
+    if scenario.contains("mixed") {
+        let requests = seen.lock().unwrap();
+        assert_eq!(
+            requests.iter().filter(|r| r.starts_with("/lookup")).count(),
+            5,
+            "batch skipped items after a failure"
+        );
+        assert_eq!(requests.iter().filter(|r| r.as_str() == "/link").count(), 4);
+    }
+    task.abort();
+}
+
+async fn read_request(stream: &mut tokio::net::TcpStream) -> String {
+    let mut request = Vec::new();
+    loop {
+        let mut buffer = [0; 4096];
+        let read = stream.read(&mut buffer).await.unwrap();
+        assert!(read > 0, "request closed before complete body");
+        request.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            if request.len() >= header_end + 4 + length {
+                break;
+            }
+        }
+    }
+    String::from_utf8(request).unwrap()
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_symlink_is_not_a_successful_apk() {
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("external-target");
+    std::fs::write(&target, "unchanged").unwrap();
+    let destination = out.path().join("com.example.app.apk");
+    std::os::unix::fs::symlink(&target, &destination).unwrap();
+    let result = download_apk(
+        "http://127.0.0.1:1/secret-path".into(),
+        "com.example.app".into(),
+        out.path(),
+        Rc::new(MultiProgress::new()),
+    )
+    .await;
+    assert!(!result, "existing symlink was accepted as a successful APK");
+    assert_eq!(std::fs::read(target).unwrap(), b"unchanged");
+    assert!(std::fs::symlink_metadata(destination)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[tokio::test]
+async fn empty_apk_response_is_a_failed_download() {
+    let out = tempfile::tempdir().unwrap();
+    let (endpoint, task) = serve_once("200 OK", "").await;
+    let result = download_apk(
+        endpoint,
+        "com.example.app".into(),
+        out.path(),
+        Rc::new(MultiProgress::new()),
+    )
+    .await;
+    task.await.unwrap();
+    assert!(!result, "empty response was published as a successful APK");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn package_validation_rejects_paths_queries_and_control_characters() {
+    for package in [
+        "../escape",
+        "/absolute",
+        "com/example",
+        "com\\example",
+        "com..example",
+        ".com.example",
+        "com.example.",
+        "com.example?token=secret",
+        "com.example#fragment",
+        "com.example\nsecret",
+        "com.42",
+        "",
+        "com.пример",
+    ] {
+        assert!(!valid_package_name(package));
+    }
+    for package in [
+        "com.example.app",
+        "com.Example_42.app",
+        "android",
+        "_example.app",
+    ] {
+        assert!(valid_package_name(package));
+    }
+}
+
+#[tokio::test]
+async fn existing_regular_file_is_preserved_as_a_successful_skip() {
+    let out = tempfile::tempdir().unwrap();
+    let destination = out.path().join("com.example.app.apk");
+    std::fs::write(&destination, "existing-apk").unwrap();
+    assert!(
+        download_apk(
+            "not-a-url".into(),
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new())
+        )
+        .await
+    );
+    assert_eq!(std::fs::read(destination).unwrap(), b"existing-apk");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
+async fn zero_parallel_is_rejected_by_the_download_helper() {
+    let out = tempfile::tempdir().unwrap();
+    let result = tokio::time::timeout(
+        TokioDuration::from_millis(100),
+        download_apps(
+            vec![("com.example.app".into(), Some("1".into()))],
+            0,
+            0,
+            out.path(),
+            HashMap::from([("rustore_version", "11500")]),
+        ),
+    )
+    .await
+    .expect("zero-parallel helper must not hang");
+    assert!(!result);
+}
+
 #[tokio::test]
 async fn truncated_http_body_reports_a_redacted_read_error() {
     let client = local_client();
