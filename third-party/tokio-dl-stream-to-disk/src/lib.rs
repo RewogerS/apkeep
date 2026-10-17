@@ -15,6 +15,8 @@
 //! ```
 
 pub mod error;
+mod network;
+pub use network::{public_http_client_builder, validate_public_url};
 
 use std::error::Error;
 use std::io::{Error as IOError, ErrorKind};
@@ -31,6 +33,9 @@ use tokio_util::io::StreamReader;
 use crate::error::{Error as TDSTDError, ErrorKind as TDSTDErrorKind};
 
 type S = dyn Stream<Item = Result<Bytes, IOError>> + Unpin;
+
+/// Per-artifact ceiling, independent of advertised length and SHA256 support.
+pub const DEFAULT_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Timeouts {
@@ -60,6 +65,8 @@ pub struct AsyncDownload {
     length: Option<u64>,
     response_stream: Option<Box<S>>,
     timeouts: Timeouts,
+    client: Option<reqwest::Client>,
+    max_bytes: u64,
 }
 
 impl AsyncDownload {
@@ -72,7 +79,25 @@ impl AsyncDownload {
             length: None,
             response_stream: None,
             timeouts: Timeouts::default(),
+            client: None,
+            max_bytes: DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// Inject a trusted client, replacing the default public-network policy.
+    /// This explicit seam permits loopback fixtures; never use an unguarded
+    /// client for URLs derived from untrusted metadata in production.
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Lower the per-artifact byte ceiling (inclusive). Values above the
+    /// absolute 2 GiB default are clamped; zero rejects every nonempty body.
+    /// The ceiling also applies to clients supplied through `with_client`.
+    pub fn with_max_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_bytes = max_bytes.min(DEFAULT_MAX_BYTES);
+        self
     }
 
     /// The advertised response length, available after `get` or `download`.
@@ -89,17 +114,42 @@ impl AsyncDownload {
     async fn get_non_consumable(&mut self) -> Result<(), Box<dyn Error>> {
         self.validate_destination()
             .map_err(|_| IOError::new(ErrorKind::InvalidInput, "invalid download destination"))?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(self.timeouts.connect)
-            .read_timeout(self.timeouts.read)
-            .timeout(self.timeouts.whole)
-            .build()?;
+        let client = if let Some(client) = &self.client {
+            client.clone()
+        } else {
+            validate_public_url(&reqwest::Url::parse(&self.url)?)?;
+            public_http_client_builder()
+                .connect_timeout(self.timeouts.connect)
+                .read_timeout(self.timeouts.read)
+                .timeout(self.timeouts.whole)
+                .build()?
+        };
         let response = client.get(&self.url).send().await?.error_for_status()?;
+        // Unsupported-scheme redirects are stopped by reqwest before custom
+        // redirect policy and returned as 3xx, not as error_for_status errors.
+        if !response.status().is_success() {
+            return Err(IOError::new(
+                ErrorKind::InvalidData,
+                "expected a successful HTTP response",
+            )
+            .into());
+        }
         self.length = response.content_length();
+        self.check_declared_length()?;
         self.response_stream =
             Some(Box::new(response.bytes_stream().map(|result| {
                 result.map_err(|e| IOError::new(ErrorKind::Other, e))
             })));
+        Ok(())
+    }
+
+    fn check_declared_length(&self) -> Result<(), IOError> {
+        if self.length.is_some_and(|length| length > self.max_bytes) {
+            return Err(IOError::new(
+                ErrorKind::InvalidData,
+                "download byte budget exceeded",
+            ));
+        }
         Ok(())
     }
 
@@ -200,6 +250,7 @@ impl AsyncDownload {
                 .await
                 .map_err(|_| TDSTDError::new(TDSTDErrorKind::InvalidResponse))?;
         }
+        self.check_declared_length()?;
         // Keep the owner in this future: error, timeout, panic or cancellation
         // unlinks its private path. Never use the final path for in-flight data.
         let temp = tempfile::Builder::new()
@@ -216,8 +267,15 @@ impl AsyncDownload {
             if count == 0 {
                 break;
             }
+            let next_total = total
+                .checked_add(count as u64)
+                .filter(|&next| next <= self.max_bytes)
+                .filter(|&next| self.length.is_none_or(|length| next <= length))
+                .ok_or_else(|| {
+                    IOError::new(ErrorKind::InvalidData, "download byte budget exceeded")
+                })?;
             dest.write_all(&buf[..count]).await?;
-            total += count as u64;
+            total = next_total;
             #[cfg(feature = "sha256sum")]
             hasher.update(&buf[..count]);
             if let Some(cb) = cb {

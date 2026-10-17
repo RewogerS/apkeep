@@ -213,7 +213,7 @@ fn network_client(
     policy: NetworkPolicy,
     total: TokioDuration,
 ) -> Result<reqwest::Client, &'static str> {
-    reqwest::Client::builder()
+    tokio_dl_stream_to_disk::public_http_client_builder()
         .connect_timeout(policy.connect)
         .read_timeout(policy.idle_read)
         .timeout(total)
@@ -282,16 +282,18 @@ pub async fn download_apps(
             "https://backapi.rustore.ru/applicationData/store-app",
             "https://backapi.rustore.ru/applicationData/v2/download-link",
         ),
+        None,
     )
     .await
 }
 
 fn valid_package_name(package: &str) -> bool {
-    package.split('.').all(|segment| {
-        let mut bytes = segment.bytes();
-        matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
-            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    })
+    package.len() <= 240
+        && package.split('.').all(|segment| {
+            let mut bytes = segment.bytes();
+            matches!(bytes.next(), Some(b) if b.is_ascii_alphabetic() || b == b'_')
+                && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        })
 }
 
 // Private transport seam only: production endpoints are fixed above.
@@ -302,6 +304,7 @@ async fn download_apps_at(
     outpath: &Path,
     options: HashMap<&str, &str>,
     endpoints: (&str, &str),
+    injected_clients: Option<(&reqwest::Client, &reqwest::Client)>,
 ) -> bool {
     if parallel == 0 {
         eprintln!("RuStore parallel must be greater than zero");
@@ -326,18 +329,32 @@ async fn download_apps_at(
         }
     };
     let policy = NetworkPolicy::default();
-    let http_client = match network_client(policy, policy.metadata_total) {
-        Ok(client) => Rc::new(client),
-        Err(error) => {
-            eprintln!("{error}");
-            return false;
+    let owned_client;
+    let http_client = if let Some((metadata, _)) = injected_clients {
+        metadata
+    } else {
+        for endpoint in [endpoints.0, endpoints.1] {
+            if reqwest::Url::parse(endpoint)
+                .ok()
+                .is_none_or(|url| tokio_dl_stream_to_disk::validate_public_url(&url).is_err())
+            {
+                eprintln!("RuStore metadata endpoint is not public HTTP(S)");
+                return false;
+            }
         }
+        owned_client = match network_client(policy, policy.metadata_total) {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("{error}");
+                return false;
+            }
+        };
+        &owned_client
     };
 
     let mp = Rc::new(MultiProgress::new());
     let results = futures_util::stream::iter(apps.into_iter().map(|app| {
         let (app_id, app_version) = app;
-        let http_client = Rc::clone(&http_client);
         let config = config.clone();
         let mp = Rc::clone(&mp);
         let mp_log = Rc::clone(&mp);
@@ -356,19 +373,28 @@ async fn download_apps_at(
                     sleep(TokioDuration::from_millis(sleep_duration)).await;
                 }
 
-                match get_app_id_at(&http_client, &config.headers, &app_id, endpoints.0).await {
+                match get_app_id_at(http_client, &config.headers, &app_id, endpoints.0).await {
                     Ok(rustore_app_id) => {
-                        match get_download_url_at(
-                            &http_client,
-                            &config,
-                            rustore_app_id,
-                            endpoints.1,
-                        )
-                        .await
+                        match get_download_url_at(http_client, &config, rustore_app_id, endpoints.1)
+                            .await
                         {
-                            Ok(download_url) => {
-                                download_apk(download_url, app_id.to_string(), outpath, mp).await
-                            }
+                            Ok(download_url) => match injected_clients {
+                                Some((_, artifact)) => {
+                                    download_apk_with_policy(
+                                        download_url,
+                                        app_id.to_string(),
+                                        outpath,
+                                        mp,
+                                        policy,
+                                        Some(artifact),
+                                    )
+                                    .await
+                                }
+                                None => {
+                                    download_apk(download_url, app_id.to_string(), outpath, mp)
+                                        .await
+                                }
+                            },
                             Err(error) => {
                                 mp_log.suspend(|| {
                                     eprintln!(
@@ -416,6 +442,7 @@ async fn download_apk(
         outpath,
         mp,
         NetworkPolicy::default(),
+        None,
     )
     .await
 }
@@ -426,6 +453,7 @@ async fn download_apk_with_policy(
     outpath: &Path,
     mp: Rc<MultiProgress>,
     policy: NetworkPolicy,
+    injected_client: Option<&reqwest::Client>,
 ) -> bool {
     use tokio::io::AsyncWriteExt;
 
@@ -439,8 +467,12 @@ async fn download_apk_with_policy(
     let destination = outpath.join(&fname);
     match std::fs::symlink_metadata(&destination) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            mp.suspend(|| println!("File already exists for {}. Skipping...", app_string));
-            return true;
+            mp.suspend(|| {
+                eprintln!(
+                    "RuStore output already exists and is unverified; use a fresh output directory"
+                )
+            });
+            return false;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         _ => {
@@ -453,12 +485,25 @@ async fn download_apk_with_policy(
             return false;
         }
     }
-    let client = match network_client(policy, policy.apk_total) {
-        Ok(client) => client,
-        Err(error) => {
-            mp.suspend(|| eprintln!("{error}"));
+    let owned_client;
+    let client = if let Some(client) = injected_client {
+        client
+    } else {
+        if reqwest::Url::parse(&download_url)
+            .ok()
+            .is_none_or(|url| tokio_dl_stream_to_disk::validate_public_url(&url).is_err())
+        {
+            mp.suspend(|| eprintln!("RuStore artifact URL is not public HTTP(S)"));
             return false;
         }
+        owned_client = match network_client(policy, policy.apk_total) {
+            Ok(client) => client,
+            Err(error) => {
+                mp.suspend(|| eprintln!("{error}"));
+                return false;
+            }
+        };
+        &owned_client
     };
     for attempt in 1..=3 {
         let result = tokio::time::timeout(policy.apk_total, async {
@@ -475,6 +520,11 @@ async fn download_apk_with_policy(
                         "Invalid response"
                     }
                 })?;
+            // error_for_status rejects 4xx/5xx, but a stopped redirect is still
+            // an Ok response. Never publish its body as a completed artifact.
+            if !response.status().is_success() {
+                return Err("RuStore APK response is not successful");
+            }
             let expected_length = response.content_length();
             if expected_length.is_some_and(|length| length > policy.apk_max_bytes) {
                 return Err("RuStore APK size limit exceeded");
@@ -523,9 +573,9 @@ async fn download_apk_with_policy(
                 .await
                 .map_err(|_| "Could not flush download file")?;
             drop(file);
-            temporary
-                .persist_noclobber(&destination)
-                .map_err(|_| "Could not publish download file")?;
+            temporary.persist_noclobber(&destination).map_err(|_| {
+                "RuStore publication failed; destination may exist and is unverified; not retrying"
+            })?;
             Ok::<(), &str>(())
         })
         .await
@@ -535,6 +585,10 @@ async fn download_apk_with_policy(
                 mp.suspend(|| println!("{} downloaded successfully!", app_string));
                 return true;
             }
+            Err(error) if error == "RuStore publication failed; destination may exist and is unverified; not retrying" => {
+                mp.suspend(|| eprintln!("{error}"));
+                return false;
+            }
             Err(error) => {
                 mp.suspend(|| eprintln!("{} for {} (attempt {}).", error, app_string, attempt))
             }
@@ -543,10 +597,11 @@ async fn download_apk_with_policy(
     false
 }
 
-pub async fn list_versions(apps: Vec<(String, Option<String>)>) {
-    for app in apps {
-        let (app_id, _) = app;
-        println!("Versions available for {} on RuStore:", app_id);
-        println!("| RuStore does not make old versions of apps available.");
+pub async fn list_versions(apps: Vec<(String, Option<String>)>) -> bool {
+    if apps.is_empty() || apps.iter().any(|(app, _)| !valid_package_name(app)) {
+        eprintln!("Invalid RuStore package name: expected ASCII identifiers, at most 240 bytes");
+    } else {
+        eprintln!("RuStore version listing is unsupported; only the latest profile-compatible download is available");
     }
+    false
 }

@@ -87,11 +87,95 @@ impl PlayBackend for Gpapi {
     }
 }
 
-fn create_api<'a>(email: &str, options: &mut HashMap<&'a str, &'a str>) -> Gpapi {
+thread_local! {
+    // Only synchronous gpapi construction is covered, never network tasks.
+    static IN_CONSTRUCTOR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn acquire_device_properties_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // A checked regular path can be replaced with a FIFO before open.
+        // O_NONBLOCK prevents that acquisition from waiting for a writer; the
+        // descriptor check below rejects it before any read. Regular-file reads
+        // keep their normal semantics. Use the platform value, not Linux bits.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    // On non-Unix targets the portable path precheck still rejects known
+    // nonregular input, but does not close the metadata/open substitution race.
+    let input = options.open(path)?;
+    if !input.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Invalid Google Play device configuration",
+        ));
+    }
+    Ok(input)
+}
+
+fn create_api<'a>(
+    email: &str,
+    options: &mut HashMap<&'a str, &'a str>,
+) -> Result<Gpapi, &'static str> {
+    use std::io::{Read, Write};
+    const ERROR: &str = "Invalid Google Play device configuration";
     let device = options.remove("device").unwrap_or("px_9a");
-    let mut api = match options.remove("device_properties_file") {
-        None => Gpapi::new(device, email),
-        Some(file) => Gpapi::from_device_properties_file(device, email, file),
+    // gpapi 6.1.0 constructors unwrap device lookup, INI reads/parsing and typed
+    // fields (src/lib.rs:160-223; snippets/device_properties.rs). They have no
+    // fallible public equivalent. Snapshot bounded custom input before invoking
+    // that API; never let its default panic hook print untrusted parser errors.
+    let snapshot = match options.remove("device_properties_file") {
+        None => None,
+        Some(path) => {
+            // Reject known nonregular paths before opening them: opening a FIFO
+            // with no writer can otherwise block before descriptor validation.
+            if !std::fs::metadata(path).map_err(|_| ERROR)?.is_file() {
+                return Err(ERROR);
+            }
+            let input = acquire_device_properties_file(Path::new(path)).map_err(|_| ERROR)?;
+            let mut bytes = Vec::new();
+            input
+                .take(256 * 1024 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| ERROR)?;
+            if bytes.len() > 256 * 1024 {
+                return Err(ERROR);
+            }
+            let mut file = tempfile::NamedTempFile::new().map_err(|_| ERROR)?;
+            file.write_all(&bytes).map_err(|_| ERROR)?;
+            Some(file)
+        }
+    };
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !IN_CONSTRUCTOR.with(|flag| flag.get()) {
+                previous(info);
+            }
+        }));
+    });
+    struct ConstructorGuard;
+    impl Drop for ConstructorGuard {
+        fn drop(&mut self) {
+            IN_CONSTRUCTOR.with(|flag| flag.set(false));
+        }
+    }
+    let mut api = {
+        IN_CONSTRUCTOR.with(|flag| flag.set(true));
+        let _guard = ConstructorGuard;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match snapshot.as_ref() {
+            None => Gpapi::new(device, email),
+            Some(file) => Gpapi::from_device_properties_file(
+                device,
+                email,
+                file.path().to_str().expect("temporary UTF-8 path"),
+            ),
+        }))
+        .map_err(|_| ERROR)?
     };
     if let Some(locale) = options.remove("locale") {
         api.set_locale(locale);
@@ -99,7 +183,7 @@ fn create_api<'a>(email: &str, options: &mut HashMap<&'a str, &'a str>) -> Gpapi
     if let Some(timezone) = options.remove("timezone") {
         api.set_timezone(timezone);
     }
-    api
+    Ok(api)
 }
 
 pub async fn download_apps(
@@ -126,7 +210,13 @@ pub async fn download_apps(
         include_additional_files: enabled(options.remove("include_additional_files")),
         include_dex_metadata: enabled(options.remove("include_dex_metadata")),
     };
-    let mut api = create_api(email, &mut options);
+    let mut api = match create_api(email, &mut options) {
+        Ok(api) => api,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
     if let Some(aas) = aas_token.filter(|s| !s.trim().is_empty()) {
         api.set_aas_token(aas);
     } else if let Some(auth) = auth_token {
@@ -335,7 +425,13 @@ pub async fn request_aas_token(
     oauth_token: &str,
     mut options: HashMap<&str, &str>,
 ) -> bool {
-    let mut api = create_api(email, &mut options);
+    let mut api = match create_api(email, &mut options) {
+        Ok(api) => api,
+        Err(error) => {
+            eprintln!("{error}");
+            return false;
+        }
+    };
     request_token_with_backend(
         &mut api,
         oauth_token,

@@ -167,6 +167,9 @@ fn apk_url(raw: &str) -> Result<reqwest::Url, &'static str> {
     Ok(url)
 }
 
+// Private transport seam. Production batch always passes public_only=true and
+// the shared guarded client; loopback fixtures explicitly inject their client
+// and disable only the initial-URL guard. No CLI/environment policy switch exists.
 async fn download_one(
     client: &reqwest::Client,
     endpoint: &str,
@@ -174,6 +177,7 @@ async fn download_one(
     version: Option<&str>,
     region: &str,
     outpath: &std::path::Path,
+    public_only: bool,
 ) -> Result<(), String> {
     use std::io::Write;
     if !valid_package(package) {
@@ -183,10 +187,19 @@ async fn download_one(
         return Err("historical versions are unsupported".to_owned());
     }
     match std::fs::symlink_metadata(outpath.join(format!("{package}.apk"))) {
-        Ok(metadata) if metadata.file_type().is_file() => return Ok(()),
+        Ok(metadata) if metadata.file_type().is_file() => {
+            return Err(
+                "output already exists and is unverified; use a fresh output directory".to_owned(),
+            )
+        }
         Ok(_) => return Err("output exists but is not a regular file".to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return Err("cannot inspect existing output".to_owned()),
+    }
+    if public_only {
+        let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid API endpoint")?;
+        tokio_dl_stream_to_disk::validate_public_url(&url)
+            .map_err(|_| "API endpoint is not public HTTP(S)")?;
     }
     let mut response = client
         .post(endpoint)
@@ -217,6 +230,13 @@ async fn download_one(
         body.extend_from_slice(&chunk);
     }
     let apk = parse_apk(&body, package)?;
+    if public_only {
+        tokio_dl_stream_to_disk::validate_public_url(&apk.url)
+            .map_err(|_| "APK URL is not public HTTP(S)")?;
+    }
+    if apk.size > 2 * 1024 * 1024 * 1024 {
+        return Err("APK size exceeds 2 GiB limit".to_owned());
+    }
     let mut response = client
         .get(apk.url)
         .send()
@@ -284,17 +304,10 @@ fn valid_package(package: &str) -> bool {
 }
 
 fn http_client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder()
+    tokio_dl_stream_to_disk::public_http_client_builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(600))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 5 || apk_url(attempt.url().as_str()).is_err() {
-                attempt.stop()
-            } else {
-                attempt.follow()
-            }
-        }))
 }
 
 pub async fn download_apps(
@@ -312,7 +325,10 @@ pub async fn download_apps(
         }
     };
     download_batch(
-        &client,
+        BatchTransport {
+            client: &client,
+            public_only: true,
+        },
         "https://store-dre.hispace.dbankcloud.com/hwmarket/api/clientApi",
         apps,
         parallel,
@@ -323,8 +339,13 @@ pub async fn download_apps(
     .await
 }
 
+struct BatchTransport<'a> {
+    client: &'a reqwest::Client,
+    public_only: bool,
+}
+
 async fn download_batch(
-    client: &reqwest::Client,
+    transport: BatchTransport<'_>,
     endpoint: &str,
     apps: Vec<(String, Option<String>)>,
     parallel: usize,
@@ -333,6 +354,10 @@ async fn download_batch(
     region: &str,
 ) -> bool {
     use futures_util::StreamExt;
+    let BatchTransport {
+        client,
+        public_only,
+    } = transport;
     if parallel == 0 || apps.is_empty() {
         eprintln!("Huawei AppGallery: nonempty app list and parallel >= 1 required");
         return false;
@@ -349,6 +374,7 @@ async fn download_batch(
                 version.as_deref(),
                 region,
                 outpath,
+                public_only,
             )
             .await;
             let label = if valid_package(&package) {
@@ -359,7 +385,7 @@ async fn download_batch(
             match result {
                 Ok(()) => {
                     println!(
-                        "Huawei AppGallery: {label}: complete or existing file (region {region})"
+                        "Huawei AppGallery: {label}: downloaded and matched API size/SHA256 (region {region})"
                     );
                     true
                 }

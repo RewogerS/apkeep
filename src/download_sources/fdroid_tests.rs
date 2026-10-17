@@ -13,6 +13,96 @@ use super::*;
 const APP: &str = "org.example.app";
 const REPO: &str = "https://repository.invalid/repo";
 
+// Explicit fixture transport injection. Public entry points never select this
+// client; only the local test harness passes it to narrow internal seams.
+fn fixture_client() -> reqwest::Client {
+    reqwest::Client::builder().no_proxy().build().unwrap()
+}
+
+async fn verify_and_return_index_from_entry(
+    dir: &TempDir,
+    repo: &str,
+    json: &str,
+    verify: bool,
+    mp: Rc<MultiProgress>,
+    format: OutputFormat,
+) -> Result<String, Box<dyn Error>> {
+    super::verify_and_return_index_from_entry(
+        dir,
+        repo,
+        json,
+        verify,
+        mp,
+        format,
+        Some(&fixture_client()),
+    )
+    .await
+}
+
+async fn download_metadata(
+    url: &str,
+    dir: &Path,
+    name: &str,
+    expected: Option<&[u8]>,
+    limit: u64,
+    deadline: Duration,
+) -> Result<(), Box<dyn Error>> {
+    super::download_metadata(
+        url,
+        dir,
+        name,
+        expected,
+        limit,
+        deadline,
+        Some(&fixture_client()),
+    )
+    .await
+}
+
+async fn download_repository_archive(
+    dir: &TempDir,
+    repo: &str,
+    entry: bool,
+    cache: Option<&Path>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    super::download_repository_archive(dir, repo, entry, cache, Some(&fixture_client())).await
+}
+
+async fn retrieve_index_using_cache(
+    options: &HashMap<&str, &str>,
+    mp: Rc<MultiProgress>,
+    format: OutputFormat,
+    cache: &Path,
+) -> Result<Value, Box<dyn Error>> {
+    super::retrieve_index_using_cache(options, mp, format, cache, Some(&fixture_client())).await
+}
+
+async fn download_from_index(
+    index: Value,
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep: u64,
+    out: &Path,
+    arch: Option<String>,
+    mp: Rc<MultiProgress>,
+) -> bool {
+    let repo = index["repo"]["address"].as_str().unwrap().to_owned();
+    super::download_from_index(
+        index,
+        apps,
+        parallel,
+        sleep,
+        out,
+        arch,
+        RepositoryDownload {
+            repo: &repo,
+            client: Some(&fixture_client()),
+            progress: mp,
+        },
+    )
+    .await
+}
+
 fn signed_fixture() -> (TempDir, Vec<String>, Vec<u8>) {
     let dir = tempdir().unwrap();
     fs::create_dir(dir.path().join("META-INF")).unwrap();
@@ -581,7 +671,7 @@ fn index(package: Value) -> Value {
 }
 
 fn v1(version: &str, filename: &str, arch: &str) -> Value {
-    json!({"versionName": version, "apkName": filename, "hash": "ab".repeat(32), "nativecode": [arch]})
+    json!({"versionCode": 1, "versionName": version, "apkName": filename, "hash": "ab".repeat(32), "nativecode": [arch]})
 }
 
 fn v2(code: u64, version: &str, filename: &str, arch: &str) -> Value {
@@ -672,18 +762,49 @@ async fn reliability_invalid_public_requests_fail_before_http() {
 }
 
 #[test]
-fn v1_latest_uses_repository_order() {
+fn v1_latest_uses_max_numeric_version_code_after_abi_filter() {
+    let mut old = v1("9.0", "old.apk", "x86");
+    old["versionCode"] = json!(9);
+    let mut latest = v1("1.0", "new.apk", "x86");
+    latest["versionCode"] = json!(10);
+    let mut other_abi = v1("99.0", "arm.apk", "arm64-v8a");
+    other_abi["versionCode"] = json!(99);
+    let packages = json!([old, other_abi, latest]);
     assert_selected(
-        parse(
-            index(json!([
-                v1("2.0", "new.apk", "arm64-v8a"),
-                v1("1.0", "old.apk", "x86")
-            ])),
-            None,
-            None,
-        ),
+        parse(index(packages.clone()), None, Some("x86")),
         None,
         "new.apk",
+    );
+    assert_selected(parse(index(packages), None, None), None, "arm.apk");
+}
+
+#[test]
+fn v1_latest_requires_numeric_code_but_pin_does_not_and_zero_is_valid() {
+    let mut zero = v1("zero", "zero.apk", "x86");
+    zero["versionCode"] = json!(0);
+    for bad_code in [Value::Null, json!("999"), json!(-1), json!(1.5)] {
+        let mut invalid = v1("invalid", "invalid.apk", "x86");
+        invalid["versionCode"] = bad_code;
+        assert_selected(
+            parse(index(json!([invalid.clone(), zero.clone()])), None, None),
+            None,
+            "zero.apk",
+        );
+        assert!(parse(index(json!([invalid.clone()])), None, None)
+            .0
+            .is_empty());
+        assert_selected(
+            parse(index(json!([invalid])), Some("invalid"), None),
+            Some("invalid"),
+            "invalid.apk",
+        );
+    }
+    let mut missing = v1("pinned", "pinned.apk", "x86");
+    missing.as_object_mut().unwrap().remove("versionCode");
+    assert_selected(
+        parse(index(json!([missing])), Some("pinned"), None),
+        Some("pinned"),
+        "pinned.apk",
     );
 }
 
@@ -998,6 +1119,273 @@ fn apk_index(repo: &str, packages: &[(&str, &str)]) -> Value {
 }
 
 #[tokio::test]
+async fn existing_hash_read_cap_detects_growth_and_preserves_exact_digest() {
+    for (body, limit, expected_ok) in [(b"good".as_slice(), 4, true), (b"good!", 4, false)] {
+        let mut reader = io::Cursor::new(body);
+        let result =
+            hash_reader_matches(&mut reader, Sha256::digest(b"good").as_slice(), limit).await;
+        if expected_ok {
+            assert!(result.unwrap());
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        }
+        assert!(reader.position() <= limit + 1);
+    }
+    let mut reader = io::Cursor::new(b"bad");
+    assert!(
+        !hash_reader_matches(&mut reader, Sha256::digest(b"good").as_slice(), 4)
+            .await
+            .unwrap()
+    );
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("slow.apk");
+    File::create(&path)
+        .unwrap()
+        .set_len(8 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        file_matches_sha256_bounded(&path, &[0; 32], 8 * 1024 * 1024, Duration::from_millis(1))
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+#[tokio::test]
+async fn public_entry_and_apk_transports_reject_private_destination_before_get() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let repo = format!("http://{}", listener.local_addr().unwrap());
+    let dir = tempdir().unwrap();
+    let entry =
+        json!({"index": {"name": "index.json", "sha256": hex::encode(Sha256::digest(b"{}"))}})
+            .to_string();
+    assert!(super::verify_and_return_index_from_entry(
+        &dir,
+        &repo,
+        &entry,
+        true,
+        progress(),
+        OutputFormat::Plaintext,
+        None
+    )
+    .await
+    .is_err());
+    assert!(
+        !super::download_from_index(
+            apk_index(REPO, &[(APP, "app.apk")]),
+            vec![(APP.into(), None)],
+            1,
+            0,
+            dir.path(),
+            None,
+            RepositoryDownload {
+                repo: &repo,
+                client: None,
+                progress: progress(),
+            },
+        )
+        .await
+    );
+    assert!(matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    // DNS aliases resolving to private addresses must fail in the same client,
+    // even though lexical URL validation alone allows this hostname.
+    let localhost = repo.replace("127.0.0.1", "localhost");
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        super::download_repository_archive(&dir, &localhost, true, None, None)
+    )
+    .await
+    .unwrap()
+    .is_err());
+    assert!(matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+}
+
+#[tokio::test]
+async fn public_metadata_transport_rejects_private_signed_repository_before_get() {
+    for use_entry in ["true", "false"] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let repo = format!(
+            "http://{}?fingerprint={FINGERPRINT}",
+            listener.local_addr().unwrap()
+        );
+        let cache = tempdir().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            super::retrieve_index_using_cache(
+                &HashMap::from([("repo", repo.as_str()), ("use_entry", use_entry)]),
+                progress(),
+                OutputFormat::Plaintext,
+                cache.path(),
+                None,
+            ),
+        )
+        .await;
+        assert!(
+            matches!(listener.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+            "a signing pin must not permit private metadata egress"
+        );
+        assert!(result
+            .expect("private URL rejection must not await network")
+            .is_err());
+    }
+}
+
+#[tokio::test]
+async fn selected_mirror_routes_apk_ignoring_malicious_index_address() {
+    let victim = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    victim.set_nonblocking(true).unwrap();
+    let malicious = format!("http://{}/private", victim.local_addr().unwrap());
+    let (mirror, server) = fixture_server(vec![http_ok(b"good")]).await;
+    let dir = tempdir().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        super::download_from_index(
+            apk_index(&malicious, &[(APP, "app.apk")]),
+            vec![(APP.into(), None)],
+            1,
+            0,
+            dir.path(),
+            None,
+            RepositoryDownload {
+                repo: &format!("{mirror}/mirror"),
+                client: Some(&fixture_client()),
+                progress: progress(),
+            },
+        ),
+    )
+    .await;
+    if result.is_err() {
+        server.abort();
+    }
+    assert!(
+        matches!(victim.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock),
+        "index repo.address must never cause a blind GET"
+    );
+    assert!(result.expect("mirror transfer deadline"));
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].starts_with("GET /mirror/app.apk HTTP/1.1"));
+    assert_eq!(
+        fs::read(dir.path().join(format!("{APP}.apk"))).unwrap(),
+        b"good"
+    );
+}
+
+#[tokio::test]
+async fn selected_mirror_routes_archive_entry_index_and_apk_in_both_formats() {
+    for entry_format in [false, true] {
+        let victim = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        victim.set_nonblocking(true).unwrap();
+        let malicious = format!("http://{}/private", victim.local_addr().unwrap());
+        let index = apk_index(&malicious, &[(APP, "app.apk")]).to_string();
+        let entry = json!({"index": {"name": "index.json", "sha256": hex::encode(Sha256::digest(index.as_bytes()))}}).to_string();
+        let archive = zip_fixture(&[
+            ("META-INF/FIXTURE.RSA", b"fixture"),
+            ("META-INF/FIXTURE.SF", SIGNED_FILE.as_bytes()),
+            ("META-INF/MANIFEST.MF", MANIFEST.as_bytes()),
+            (
+                if entry_format {
+                    "entry.json"
+                } else {
+                    "index-v1.json"
+                },
+                if entry_format {
+                    entry.as_bytes()
+                } else {
+                    index.as_bytes()
+                },
+            ),
+        ]);
+        let mut responses = vec![http_ok(&archive)];
+        if entry_format {
+            responses.push(http_ok(index.as_bytes()));
+        }
+        responses.push(http_ok(b"good"));
+        let (mirror, server) = fixture_server(responses).await;
+        let dir = tempdir().unwrap();
+        fs::create_dir(dir.path().join("out")).unwrap();
+        let output =
+            captured_disclosure_child("download", &format!("{mirror}/mirror"), entry_format, &dir)
+                .await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(matches!(victim.accept(), Err(err) if err.kind() == io::ErrorKind::WouldBlock));
+        let requests = server.await.unwrap();
+        let mut paths = vec![if entry_format {
+            "entry.jar"
+        } else {
+            "index-v1.jar"
+        }];
+        if entry_format {
+            paths.push("index.json");
+        }
+        paths.push("app.apk");
+        assert_eq!(requests.len(), paths.len());
+        for (request, path) in requests.iter().zip(paths) {
+            assert!(request.starts_with(&format!("GET /mirror/{path} HTTP/1.1")));
+        }
+        assert_eq!(
+            fs::read(dir.path().join(format!("out/{APP}.apk"))).unwrap(),
+            b"good"
+        );
+    }
+}
+
+#[tokio::test]
+async fn existing_apk_hash_rejects_oversized_file_before_streaming() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("oversized.apk");
+    File::create(&path)
+        .unwrap()
+        .set_len(2 * 1024 * 1024 * 1024 + 1)
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result = file_matches_sha256(&path, &[0; 32]).await;
+    assert!(
+        result.is_err(),
+        "oversized existing APK must fail size policy, not hash the entire file"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn duplicate_batch_requests_download_once_without_false_selection_failure() {
+    let (repo, server) = fixture_server(vec![http_ok(b"good")]).await;
+    let dir = tempdir().unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        download_from_index(
+            apk_index(&repo, &[(APP, "app.apk")]),
+            vec![(APP.into(), None), (APP.into(), None)],
+            2,
+            0,
+            dir.path(),
+            None,
+            progress(),
+        ),
+    )
+    .await
+    .expect("duplicate batch deadline");
+    assert!(
+        result,
+        "identical valid requests must share one successful job"
+    );
+    assert_eq!(server.await.unwrap().len(), 1);
+    assert_eq!(
+        fs::read(dir.path().join(format!("{APP}.apk"))).unwrap(),
+        b"good"
+    );
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn reliability_all_download_jobs_run_even_after_checksum_failure() {
     let (repo, server) = fixture_server(vec![
         http_ok(b"wrong"),
@@ -1268,6 +1656,30 @@ async fn reliability_metadata_status_size_and_deadline_fail_without_publication(
 }
 
 #[tokio::test]
+async fn archive_stopped_redirect_is_rejected_before_creating_output() {
+    for location in ["", "Location: file:///PRIVATE_REDIRECT_TARGET\r\n"] {
+        let response = format!(
+            "HTTP/1.1 302 Found\r\n{location}Content-Length: 4\r\nConnection: close\r\n\r\nbody"
+        )
+        .into_bytes();
+        let (repo, server) = fixture_server(vec![response]).await;
+        let dir = tempdir().unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            download_repository_archive(&dir, &repo, true, None),
+        )
+        .await
+        .expect("archive stopped-redirect deadline");
+        server.await.unwrap();
+        assert!(
+            result.is_err(),
+            "non-success archive status must be rejected"
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test]
 async fn reliability_archive_http_errors_and_missing_etag_do_not_panic() {
     let (repo, server) = fixture_server(vec![
         b"HTTP/1.1 500 Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
@@ -1535,8 +1947,21 @@ async fn disclosure_child() {
             )
             .await
         }
-        "download" => download_apps(vec![(APP.into(), None)], 1, 0, &out, options).await,
-        _ => list_versions(vec![(APP.into(), None)], options).await,
+        "download" => {
+            download_apps_with_client(
+                vec![(APP.into(), None)],
+                1,
+                0,
+                &out,
+                options,
+                Some(&fixture_client()),
+            )
+            .await
+        }
+        _ => {
+            list_versions_with_client(vec![(APP.into(), None)], options, Some(&fixture_client()))
+                .await
+        }
     };
     io::stdout().flush().unwrap();
     io::stderr().flush().unwrap();

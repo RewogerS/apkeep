@@ -121,7 +121,7 @@ fn rustore_input_errors_are_reported_on_stderr() {
 }
 
 #[test]
-fn latest_only_listing_keeps_its_successful_offline_behavior() {
+fn latest_only_listing_is_explicitly_unsupported_without_network() {
     let output = Command::new(env!("CARGO_BIN_EXE_apkeep"))
         .args([
             "-a",
@@ -137,9 +137,35 @@ fn latest_only_listing_keeps_its_successful_offline_behavior() {
         .env("APKEEP_RUSTORE_VER", "secret-invalid-version")
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert!(output.stderr.is_empty());
-    assert_eq!(String::from_utf8(output.stdout).unwrap(), "Versions available for com.example.app on RuStore:\n| RuStore does not make old versions of apps available.\n");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("listing is unsupported"));
+}
+
+#[test]
+fn invalid_or_overlong_rustore_package_fails_without_echo_or_network() {
+    for package in [
+        "PRIVATE_PACKAGE\n".to_owned(),
+        format!("com.{}", "PRIVATE_PACKAGE".repeat(30)),
+    ] {
+        for list in [false, true] {
+            let out = tempfile::tempdir().unwrap();
+            let mut command = Command::new(env!("CARGO_BIN_EXE_apkeep"));
+            command.args(["-d", "ru-store", "-a", &package]);
+            if list {
+                command.arg("-l");
+            } else {
+                command.arg(out.path());
+            }
+            let output = command.env_remove("APKEEP_RUSTORE_VER").output().unwrap();
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            let error = String::from_utf8_lossy(&output.stderr);
+            assert!(error.contains("Invalid RuStore package name"), "{error}");
+            assert!(!error.contains("PRIVATE_PACKAGE"), "{error}");
+            assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+        }
+    }
 }
 
 #[test]

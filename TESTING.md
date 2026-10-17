@@ -53,6 +53,17 @@ same bounded backend adapter as the real gpapi caller, with no Google login. The
 POSIX terminal test uses a real PTY and a deliberately invalid synthetic token;
 it asserts no-echo, terminal restoration and refusal before authentication.
 
+## Source-review contract regressions
+
+The real child CLI checks stderr-only input/OUTPATH/CSV failures in JSON mode,
+redacted gpapi constructor errors (download and OAuth paths), RuStore bounded
+package/listing behavior, and rejection of existing unverified files. Store unit
+fixtures check one-attempt publication-race failure, production-client refusal of
+loopback DNS and private artifact URLs, and successful transfers only through
+explicit injected fixture clients. No environment switch disables the production
+network policy. Test success does not establish manifest/publisher validity,
+live availability or Google Play internal-network coverage.
+
 ## Shared downloader dependency
 
 The root Cargo patch uses the MIT-preserving local copy documented in

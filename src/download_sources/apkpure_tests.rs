@@ -1,4 +1,100 @@
 use super::*;
+
+#[tokio::test(flavor = "current_thread")]
+async fn default_artifact_path_rejects_private_and_credential_urls_without_fetching() {
+    for malicious in [
+        "http://169.254.169.254/private",
+        "http://user:PRIVATE_TOKEN@example.com/private",
+    ] {
+        let server = Server::new(200, |_| format!("APKJ..{malicious}"), 200);
+        let client = fixture_client();
+        let response = client
+            .get(format!("{}/metadata", server.base))
+            .send()
+            .await
+            .unwrap();
+        let out = tempfile::tempdir().unwrap();
+        assert!(
+            !download_from_response(
+                response,
+                &download_regex(None),
+                "com.example.app".into(),
+                out.path(),
+                Rc::new(MultiProgress::new()),
+                None
+            )
+            .await
+        );
+        assert_eq!(server.paths(), ["/metadata"]);
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+    let server = Server::new(200, |base| format!("APKJ..{base}/artifact"), 200);
+    let client = fixture_client();
+    let response = client
+        .get(format!("{}/metadata", server.base))
+        .send()
+        .await
+        .unwrap();
+    let out = tempfile::tempdir().unwrap();
+    assert!(
+        !download_from_response(
+            response,
+            &download_regex(None),
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+            None
+        )
+        .await
+    );
+    assert_eq!(server.paths(), ["/metadata"]);
+}
+
+async fn injected_download_apps_using(
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep: u64,
+    out: &Path,
+    options: HashMap<&str, &str>,
+    client: &Client,
+    endpoint: Endpoint<'_>,
+) -> bool {
+    download_apps_using(
+        apps,
+        parallel,
+        sleep,
+        out,
+        options,
+        DownloadTransport {
+            metadata: client,
+            endpoint,
+            artifact: Some(client),
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn production_client_denies_loopback_dns_before_connecting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://localhost:{}/private?token=PRIVATE_TOKEN",
+        listener.local_addr().unwrap().port()
+    );
+    let client = metadata_client().unwrap();
+    let _ = client
+        .get(url)
+        .timeout(Duration::from_millis(80))
+        .send()
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "production client connected to loopback"
+    );
+}
+
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
@@ -378,6 +474,7 @@ async fn consume(server: &Server, out: &Path, app: &str) -> bool {
             Rc::new(MultiProgress::with_draw_target(
                 indicatif::ProgressDrawTarget::hidden(),
             )),
+            Some(&client),
         ),
     )
     .await
@@ -464,10 +561,10 @@ async fn response_preserves_existing_file_even_when_network_has_new_bytes() {
     let out = tempfile::tempdir().unwrap();
     let file = out.path().join("com.example.fixture.apk");
     std::fs::write(&file, b"original marker").unwrap();
-    assert!(consume(&server, out.path(), "com.example.fixture").await);
+    assert!(!consume(&server, out.path(), "com.example.fixture").await);
     assert_eq!(std::fs::read(file).unwrap(), b"original marker");
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
-    // Existing regular files are skipped, without fetching another artifact.
+    // Existing bytes are preserved but rejected; no artifact is fetched.
     assert_eq!(server.paths(), ["/metadata"]);
 }
 
@@ -548,7 +645,7 @@ async fn invalid_components_never_reach_endpoint_in_download_or_listing() {
         ),
     ];
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps.clone(),
             2,
             0,
@@ -565,7 +662,7 @@ async fn invalid_components_never_reach_endpoint_in_download_or_listing() {
         let mut options = acknowledged();
         options.insert("arch", arch);
         assert!(
-            !download_apps_using(
+            !injected_download_apps_using(
                 apps.clone(),
                 1,
                 0,
@@ -589,7 +686,7 @@ async fn zero_parallelism_and_missing_acknowledgement_are_false_without_network(
         |_: &str| -> Result<Url, &'static str> { panic!("invalid batch reached endpoint") };
     let apps = vec![("com.example.fixture".to_owned(), None)];
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps.clone(),
             0,
             0,
@@ -601,7 +698,8 @@ async fn zero_parallelism_and_missing_acknowledgement_are_false_without_network(
         .await
     );
     assert!(
-        !download_apps_using(apps, 1, 0, out.path(), HashMap::new(), &client, &forbidden).await
+        !injected_download_apps_using(apps, 1, 0, out.path(), HashMap::new(), &client, &forbidden)
+            .await
     );
 }
 
@@ -628,7 +726,7 @@ async fn download_batch_runs_every_item_and_aggregates_failures() {
         ];
         let out = tempfile::tempdir().unwrap();
         assert!(
-            !download_apps_using(
+            !injected_download_apps_using(
                 apps,
                 parallel,
                 0,
@@ -664,7 +762,7 @@ async fn download_batch_success_preserves_safe_version_arch_filename() {
     options.insert("arch", "x86;arm64-v8a");
     let apps = vec![("com.example.fixture".to_owned(), Some("1.0+rc".to_owned()))];
     assert!(
-        download_apps_using(
+        injected_download_apps_using(
             apps,
             1,
             1,
@@ -754,7 +852,7 @@ async fn network_connect_errors_are_false_for_download_and_listing() {
     let apps = vec![("com.example.fixture".to_owned(), None)];
     let out = tempfile::tempdir().unwrap();
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps.clone(),
             1,
             0,
@@ -778,7 +876,7 @@ async fn metadata_body_errors_are_results_not_panics() {
     let apps = vec![("com.example.fixture".to_owned(), None)];
     let out = tempfile::tempdir().unwrap();
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps.clone(),
             1,
             0,
@@ -894,7 +992,7 @@ async fn requested_version_without_url_does_not_fetch_next_versions_artifact() {
     let apps = vec![("com.example.fixture".to_owned(), Some("1.0".to_owned()))];
     let out = tempfile::tempdir().unwrap();
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps,
             1,
             0,
@@ -934,7 +1032,7 @@ async fn apkpure_diagnostics_child() {
         }
         let apps = vec![(app.to_owned(), version.map(str::to_owned))];
         assert!(
-            !download_apps_using(
+            !injected_download_apps_using(
                 apps.clone(),
                 1,
                 0,
@@ -957,7 +1055,7 @@ async fn apkpure_diagnostics_child() {
     let endpoint = |_: &str| Ok(url.clone());
     let apps = vec![("com.example.failure".to_owned(), None)];
     assert!(
-        !download_apps_using(
+        !injected_download_apps_using(
             apps.clone(),
             1,
             0,

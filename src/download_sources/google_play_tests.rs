@@ -1,5 +1,64 @@
 // All backend outcomes and credentials here are synthetic; no Google requests.
 use super::*;
+
+#[test]
+fn constructor_panic_hook_forwards_unrelated_panics_on_same_and_other_threads() {
+    if std::env::var_os("APKEEP_GPAPI_HOOK_FIXTURE").is_some() {
+        std::panic::set_hook(Box::new(|_| eprintln!("EXPECTED_UNRELATED_PANIC")));
+        assert!(create_api(
+            "fixture@example.invalid",
+            &mut HashMap::from([("device", "PRIVATE_INVALID_DEVICE")])
+        )
+        .is_err());
+        assert!(std::panic::catch_unwind(|| panic!("unrelated local panic")).is_err());
+        std::thread::spawn(|| {
+            assert!(std::panic::catch_unwind(|| panic!("unrelated thread panic")).is_err());
+        })
+        .join()
+        .unwrap();
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "download_sources::google_play::tests::constructor_panic_hook_forwards_unrelated_panics_on_same_and_other_threads", "--nocapture"])
+        .env("APKEEP_GPAPI_HOOK_FIXTURE", "1").output().unwrap();
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("EXPECTED_UNRELATED_PANIC").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(!stderr.contains("PRIVATE_INVALID_DEVICE"));
+}
+
+#[tokio::test]
+async fn constructor_boundary_recovers_and_preserves_valid_builtin_and_custom_profiles() {
+    assert!(create_api(
+        "fixture@example.invalid",
+        &mut HashMap::from([("device", "PRIVATE_INVALID_DEVICE")])
+    )
+    .is_err());
+    assert!(!IN_CONSTRUCTOR.with(|flag| flag.get()));
+    assert!(create_api("fixture@example.invalid", &mut HashMap::new()).is_ok());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), "[default]\nSharedLibraries=android.test\nFeatures=android.hardware.camera\nLocales=en_US\nGL.Extensions=GL_EXT_test\n").unwrap();
+    assert!(create_api(
+        "fixture@example.invalid",
+        &mut HashMap::from([
+            ("device", "default"),
+            ("device_properties_file", file.path().to_str().unwrap())
+        ])
+    )
+    .is_ok());
+    std::fs::write(file.path(), vec![b'x'; 256 * 1024 + 1]).unwrap();
+    assert!(create_api(
+        "fixture@example.invalid",
+        &mut HashMap::from([("device_properties_file", file.path().to_str().unwrap())])
+    )
+    .is_err());
+    assert!(!IN_CONSTRUCTOR.with(|flag| flag.get()));
+}
+
 use crate::cli;
 use gpapi::error::{Error as GpError, ErrorKind};
 use std::cell::RefCell;
@@ -849,6 +908,64 @@ async fn cancelling_the_whole_batch_drops_private_partial_staging() {
     assert_eq!(backend.stages.borrow().len(), 1);
     assert!(backend.stages.borrow().iter().all(|stage| !stage.exists()));
     assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn device_file_fifo_substitution_during_acquisition_is_rejected_without_blocking() {
+    const CHILD: &str = "APKEEP_TEST_FIFO_SUBSTITUTION";
+    if let Some(path) = std::env::var_os(CHILD) {
+        let path = Path::new(&path);
+        // Deterministically replace the checked regular file at the exact
+        // metadata/open boundary; no FIFO writer exists in either process.
+        assert!(std::fs::metadata(path).unwrap().is_file());
+        std::fs::remove_file(path).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            super::acquire_device_properties_file(path)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        return;
+    }
+    let fixture = tempfile::tempdir().unwrap();
+    let path = fixture.path().join("PRIVATE_DEVICE_FIFO");
+    std::fs::write(&path, b"regular profile before substitution").unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "download_sources::google_play::tests::device_file_fifo_substitution_during_acquisition_is_rejected_without_blocking",
+            "--nocapture",
+        ])
+        .env(CHILD, &path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            let out = child.wait_with_output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("device file acquisition blocked after FIFO substitution");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

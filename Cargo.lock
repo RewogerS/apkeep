@@ -101,6 +101,7 @@ dependencies = [
  "gpapi",
  "hex",
  "indicatif",
+ "libc",
  "regex",
  "reqwest 0.13.5",
  "ring",

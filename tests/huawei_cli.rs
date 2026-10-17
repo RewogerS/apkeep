@@ -56,7 +56,7 @@ fn pinned_versions_and_unsafe_packages_fail_without_network() {
 }
 
 #[test]
-fn existing_regular_file_succeeds_and_mixed_batch_fails_without_overwrite() {
+fn existing_regular_file_is_unverified_and_mixed_batch_fails_without_overwrite() {
     let out = tempfile::tempdir().unwrap();
     let apk = out.path().join("com.example.app.apk");
     std::fs::write(&apk, b"existing").unwrap();
@@ -71,10 +71,12 @@ fn existing_regular_file_succeeds_and_mixed_batch_fails_without_overwrite() {
         .output()
         .unwrap();
     assert!(
-        result.status.success(),
+        !result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    assert!(result.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("unverified"));
     let csv = tempfile::NamedTempFile::new().unwrap();
     std::fs::write(csv.path(), "com.example.app,\ncom.example.app,1.0\n").unwrap();
     let result = Command::new(env!("CARGO_BIN_EXE_apkeep"))

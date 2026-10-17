@@ -35,6 +35,22 @@ or a blanket security certification. Detailed contracts are in [RELIABILITY.md](
   9.0.3. Dependency audit reports, advisory database provenance and test logs are
   retained outside the source checkout.
 
+## Source-review contract remediation
+
+Input/OUTPATH and CSV failures now use redacted stderr, including JSON mode.
+RuStore bounds package IDs to 240 bytes before network work; unsupported listing
+returns status 1 and never echoes invalid input. Empty `-a package@` means latest,
+matching an empty selected CSV version. Publication races fail without trusting
+another writer's file or repeating a transfer. RuStore/Huawei/APKPure no longer
+report existing unverified outputs as successful skips.
+
+Shared public-network policy covers production RuStore/Huawei/APKPure metadata
+and artifacts as well as F-Droid, with explicit injected clients for loopback
+fixtures. gpapi's own internal HTTP remains outside that policy. These changes
+do not close Huawei ZIP/manifest/publisher validation, add typed per-item
+not-found exit codes, or provide dirfd isolation against a hostile local owner.
+See RELIABILITY.md and source-specific usage for compatibility changes/limits.
+
 ## Not certified or not activated
 
 | Area | Remaining boundary |
@@ -43,7 +59,7 @@ or a blanket security certification. Detailed contracts are in [RELIABILITY.md](
 | Public stores | Loopback fixtures cannot certify API availability, anti-bot behavior or that every real response variant is supported. Live checks are separately reported with exact binary hashes. |
 | F-Droid trust | Offline signed fixtures test the implementation, not the legitimacy of a chosen custom repository key. `verify-index=false` remains an explicit opt-out and must never be confused with verification. |
 | APKPure | Downloads still require `acknowledge_dangers=true`; metadata matching is not publisher-signature or APK-authenticity validation. |
-| Existing outputs | No overwrite is not a fresh validation of a file left by an older binary. Delete/revalidate old partials before treating them as trusted artifacts. |
+| Existing outputs | RuStore/Huawei/APKPure preserve but reject existing outputs as unverified. F-Droid rechecks indexed SHA256. No overwrite alone is not validation or publisher authenticity. |
 | Crash/resource limits | Normal async drop/cancellation is covered. SIGKILL, machine failure, filesystem durability, arbitrary disk exhaustion and atomic rollback of multiple artifacts are not globally guaranteed. |
 | Credentials | CLI token arguments remain visible to shell history/process inspection. Successful token-retrieval stdout is intentionally secret-bearing. The no-echo prompt/permission-restricted INI are preferable. |
 | Dependencies | `bincode` 2.0.1 is unmaintained (RUSTSEC-2025-0141), inherited through gpapi. This warning alone is not a demonstrated exploitable vulnerability. |

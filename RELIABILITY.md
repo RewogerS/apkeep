@@ -4,7 +4,17 @@
 
 - APKPure, F-Droid and Google Play download/list/token callers report failure
   through the real CLI exit status, not only printed diagnostics. An unsupported
-  Google Play version listing returns nonzero; it is not a successful empty list.
+  Google Play or RuStore version listing returns nonzero; it is not a successful
+  empty list. Huawei's compatibility listing is only an offline informational
+  explanation (status 0 for valid IDs), not a remote availability check.
+- Status `1` is an aggregate failure, **not** a stable machine-readable "not found"
+  code. It also covers unsupported operations, invalid input, network, integrity
+  and local I/O errors. Status `2` denotes argument-parser errors. Do not infer
+  store absence from a nonzero exit or missing output; typed per-item absence
+  versus unperformed-check outcomes require a future result-schema change.
+- All input, CSV and OUTPATH diagnostics use stderr, without raw paths/argv or
+  Debug-formatted errors. JSON listing stdout is either empty on preflight failure
+  or the source's JSON document, never usage/error text.
 - Mixed batches retain completed outputs and process remaining valid inputs, but
   any failed/invalid item makes the overall command fail. Consumers must check
   exit status **and** validate the selected completed artifact; neither alone
@@ -20,6 +30,9 @@ writes and flush, then no-clobber publication. Its F-Droid checksum API verifies
 SHA256 **before** the final filename becomes visible. Truncation, empty bodies,
 errors and cancellation do not leave the partial under the final name. Existing
 regular outputs are not overwritten; existing symlinks/directories are errors.
+RuStore, Huawei and APKPure reject pre-existing regular outputs as unverified,
+rather than reporting the old successful skip. F-Droid may accept an existing
+APK only after checking its indexed SHA256. No-clobber alone is not validation.
 
 Google Play uses a separate private directory for each attempt, retaining gpapi's
 plain/split/extra-file layout. Failed or timed-out attempts are discarded rather
@@ -35,12 +48,33 @@ transaction or multi-artifact atomicity is claimed. OUTPATH and its ancestors
 must be trusted and not concurrently replaced by other users; pathname-based
 publication is not a dirfd-based defense against a hostile local filesystem owner.
 
+## Public HTTP boundary
+
+Production metadata and artifact clients for RuStore, Huawei, APKPure and F-Droid
+use the shared public-network builder and validate initial URLs. Only HTTP(S)
+without URL credentials is allowed; literal private/link-local/loopback/reserved
+addresses and nonpublic DNS answers are refused. Checked DNS answers are passed
+directly to the connector, and every redirect is checked again. Environment
+proxies are disabled. This is an intentional compatibility restriction: there is
+no CLI or environment switch for private endpoints. Loopback tests explicitly
+inject trusted clients through private seams; ordinary builds/tests retain the
+production policy unless that seam is deliberately used.
+
+Google Play remains a boundary: gpapi's internal authentication/metadata HTTP
+clients are not under this builder's control. Do not describe this as uniform
+SSRF protection for all Google Play paths. Likewise, URL policy and byte limits
+do not verify APK manifests, ZIP CRC, publisher identity, or installability.
+RuStore and APKPure offer no API-checksum authenticity guarantee here. Huawei
+checks agreement with API size/SHA256 only, not the manifest's package/versionCode
+or signing identity. A separate APK validator is required for those guarantees.
+
 ## CSV and credentials
 
 CSV is parsed as CSV, not split on commas. Quoted commas, escaped quotes and
 multiline quoted fields are supported; malformed quoting is rejected. Selected
 app/version columns must be present on every nonblank row. An explicitly empty
-version cell means `latest`; a missing cell is an error. A blank app, empty batch,
+version cell or the empty suffix in `-a package@` means `latest`; a missing CSV
+version cell is an error. A blank app, empty batch,
 control characters in a selected value and inputs over 8 MiB are rejected.
 
 An explicitly selected Google Play INI is mandatory and must parse even when

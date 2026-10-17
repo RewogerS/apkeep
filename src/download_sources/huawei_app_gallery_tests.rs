@@ -1,4 +1,143 @@
 use super::*;
+
+#[tokio::test]
+async fn api_apk_size_above_absolute_cap_is_rejected_before_artifact_request() {
+    let server = Server::new(|base| {
+        let mut item = entry(&format!("{base}/artifact"));
+        item["size"] = json!(2u64 * 1024 * 1024 * 1024 + 1);
+        item["fullSize"] = item["size"].clone();
+        vec![
+            Reply::ok(serde_json::to_vec(&json!({"rtnCode":0,"list":[item]})).unwrap()),
+            Reply::ok(b"abc".to_vec()),
+        ]
+    })
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let error = injected_download_one(
+        &test_client(),
+        &server.endpoint,
+        "com.example.app",
+        None,
+        "IE",
+        out.path(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error, "APK size exceeds 2 GiB limit");
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn production_url_checks_reject_private_metadata_and_artifact_before_connecting() {
+    for artifact in [
+        "http://127.0.0.1/private",
+        "http://169.254.169.254/private",
+        "http://[::1]/private",
+        "http://user:PRIVATE_TOKEN@example.com/private",
+    ] {
+        let server = Server::new(|_| vec![api_reply(artifact)]).await;
+        let endpoint = reqwest::Url::parse(&server.endpoint).unwrap();
+        let addr =
+            std::net::SocketAddr::new("127.0.0.1".parse().unwrap(), endpoint.port().unwrap());
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve("public.fixture", addr)
+            .build()
+            .unwrap();
+        let public_endpoint = server.endpoint.replace("127.0.0.1", "public.fixture");
+        let out = tempfile::tempdir().unwrap();
+        let error = download_one(
+            &client,
+            &public_endpoint,
+            "com.example.app",
+            None,
+            "IE",
+            out.path(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("public HTTP(S)") || error.contains("invalid APK URL"),
+            "{error}"
+        );
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        let error = download_one(
+            &client,
+            &server.endpoint,
+            "com.example.app",
+            None,
+            "IE",
+            out.path(),
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("API endpoint is not public"));
+        assert_eq!(server.requests.lock().unwrap().len(), 1);
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+}
+
+async fn injected_download_one(
+    client: &reqwest::Client,
+    endpoint: &str,
+    package: &str,
+    version: Option<&str>,
+    region: &str,
+    out: &std::path::Path,
+) -> Result<(), String> {
+    download_one(client, endpoint, package, version, region, out, false).await
+}
+async fn injected_download_batch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep: u64,
+    out: &std::path::Path,
+    region: &str,
+) -> bool {
+    download_batch(
+        BatchTransport {
+            client,
+            public_only: false,
+        },
+        endpoint,
+        apps,
+        parallel,
+        sleep,
+        out,
+        region,
+    )
+    .await
+}
+
+#[tokio::test]
+async fn production_client_denies_loopback_dns_before_connecting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://localhost:{}/private?token=PRIVATE_TOKEN",
+        listener.local_addr().unwrap().port()
+    );
+    let client = http_client_builder()
+        .timeout(Duration::from_millis(80))
+        .build()
+        .unwrap();
+    let _ = client
+        .get(url)
+        .timeout(Duration::from_millis(80))
+        .send()
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "production client connected to loopback"
+    );
+}
+
 use serde_json::{json, Value};
 use std::collections::HashMap;
 
@@ -128,7 +267,16 @@ fn api_reply(url: &str) -> Reply {
 }
 
 fn test_client() -> reqwest::Client {
-    http_client_builder()
+    // Explicitly injected fixture client: retain structural redirect tests without
+    // weakening the production public-network policy.
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 5 || apk_url(attempt.url().as_str()).is_err() {
+                attempt.stop()
+            } else {
+                attempt.follow()
+            }
+        }))
         .no_proxy()
         .timeout(Duration::from_millis(300))
         .build()
@@ -156,7 +304,7 @@ async fn partial_files_are_unpublished_and_cleaned_on_timeout_or_publication_rac
         let target = out.path().join("com.example.app.apk");
         let client = test_client();
         let (result, ()) = tokio::join!(
-            download_one(
+            injected_download_one(
                 &client,
                 &server.endpoint,
                 "com.example.app",
@@ -225,7 +373,7 @@ async fn apk_http_and_timeout_errors_never_publish_output() {
             Server::new(|base| vec![api_reply(&format!("{base}/full.apk?sig=SECRET")), reply])
                 .await;
         let out = tempfile::tempdir().unwrap();
-        let error = download_one(
+        let error = injected_download_one(
             &test_client(),
             &server.endpoint,
             "com.example.app",
@@ -251,7 +399,7 @@ async fn diagnostic_fixture_child() {
         return;
     };
     let outpath = std::env::var("APKEEP_HUAWEI_TEST_OUTPATH").unwrap();
-    let success = download_batch(
+    let success = injected_download_batch(
         &test_client(),
         &endpoint,
         vec![("com.example.app".into(), None)],
@@ -327,7 +475,7 @@ async fn redirect_targets_must_also_pass_url_validation() {
     })
     .await;
     let out = tempfile::tempdir().unwrap();
-    let error = download_one(
+    let error = injected_download_one(
         &test_client(),
         &server.endpoint,
         "com.example.app",
@@ -359,7 +507,7 @@ async fn valid_redirects_work_and_excessive_redirects_are_bounded() {
         })
         .await;
         let out = tempfile::tempdir().unwrap();
-        let result = download_one(
+        let result = injected_download_one(
             &test_client(),
             &server.endpoint,
             "com.example.app",
@@ -387,7 +535,7 @@ async fn existing_nonregular_output_is_never_followed_or_overwritten() {
     let out = tempfile::tempdir().unwrap();
     let target = out.path().join("com.example.app.apk");
     std::fs::create_dir(&target).unwrap();
-    let error = download_one(
+    let error = injected_download_one(
         &test_client(),
         "http://127.0.0.1:1",
         "com.example.app",
@@ -402,7 +550,7 @@ async fn existing_nonregular_output_is_never_followed_or_overwritten() {
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(out.path().join("nonexistent"), &target).unwrap();
-        let error = download_one(
+        let error = injected_download_one(
             &test_client(),
             "http://127.0.0.1:1",
             "com.example.app",
@@ -444,7 +592,7 @@ fn package_ids_are_safe_single_filenames() {
 async fn api_response_is_bounded_before_parsing() {
     let server = Server::new(|_| vec![Reply::ok(vec![b' '; 1024 * 1024 + 1])]).await;
     let out = tempfile::tempdir().unwrap();
-    let error = download_one(
+    let error = injected_download_one(
         &test_client(),
         &server.endpoint,
         "com.example.app",
@@ -470,7 +618,7 @@ async fn loopback_api_errors_are_distinct_safe_and_never_start_apk_download() {
     ] {
         let server = Server::new(|_| vec![reply]).await;
         let out = tempfile::tempdir().unwrap();
-        let error = download_one(&test_client(), &server.endpoint, "com.example.app", None, "CN", out.path()).await.unwrap_err();
+        let error = injected_download_one(&test_client(), &server.endpoint, "com.example.app", None, "CN", out.path()).await.unwrap_err();
         assert!(error.contains(expected), "{error}");
         assert!(!error.contains("SECRET"));
         assert_eq!(server.requests.lock().unwrap().len(), 1);
@@ -481,7 +629,7 @@ async fn loopback_api_errors_are_distinct_safe_and_never_start_apk_download() {
     drop(socket);
     let out = tempfile::tempdir().unwrap();
     assert_eq!(
-        download_one(
+        injected_download_one(
             &test_client(),
             &endpoint,
             "com.example.app",
@@ -507,7 +655,7 @@ async fn loopback_batch_keeps_processing_after_failure_and_aggregates_result() {
     .await;
     let out = tempfile::tempdir().unwrap();
     assert!(
-        !download_batch(
+        !injected_download_batch(
             &test_client(),
             &server.endpoint,
             vec![
@@ -548,7 +696,7 @@ async fn rejects_corrupt_short_oversize_and_truncated_downloads_and_cleans_tempo
         })
         .await;
         let out = tempfile::tempdir().unwrap();
-        let error = download_one(
+        let error = injected_download_one(
             &test_client(),
             &server.endpoint,
             "com.example.app",
@@ -575,7 +723,7 @@ async fn loopback_downloads_complete_apk_and_sends_encoded_form() {
         })
         .await;
         let out = tempfile::tempdir().unwrap();
-        download_one(
+        injected_download_one(
             &test_client(),
             &server.endpoint,
             "com.example.app",

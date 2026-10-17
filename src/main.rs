@@ -118,10 +118,10 @@
 //! * The Google Play Store (`-d google-play`), given an email address and AAS token
 //! * APKPure (`-d apk-pure`), a third-party site hosting APKs available on the Play Store
 //! * Huawei AppGallery (`-d huawei-app-gallery`), with explicit regional selection and
-//!   verified full-APK downloads; see [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
+//!   API-size/SHA256-checked downloads; see [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
 //! * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
-//! verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
-//! was downloaded but could not be verified
+//! authenticates the repository index and checks each APK against its indexed SHA256
+//! before publication; an APK that fails verification is not published
 //! * RuStore (`-d ru-store`), a Russian app store platform
 //!
 //! # Usage Note
@@ -162,15 +162,28 @@ use download_sources::google_play;
 use download_sources::rustore;
 
 type CSVList = Vec<(String, Option<String>)>;
+fn single_app(app: &str) -> (String, Option<String>) {
+    let mut parts = app.splitn(2, '@');
+    (
+        parts.next().unwrap().to_owned(),
+        parts
+            .next()
+            .filter(|version| !version.is_empty())
+            .map(str::to_owned),
+    )
+}
+
 fn fetch_csv_list(
     csv: &str,
     field: usize,
     version_field: Option<usize>,
 ) -> Result<CSVList, Box<dyn Error>> {
     let mut text = String::new();
-    File::open(csv)?
+    File::open(csv)
+        .map_err(|_| "Could not open CSV input file")?
         .take(8 * 1024 * 1024 + 1)
-        .read_to_string(&mut text)?;
+        .read_to_string(&mut text)
+        .map_err(|_| "Could not read CSV input file as UTF-8")?;
     parse_csv_text(text, field, version_field)
 }
 
@@ -284,8 +297,29 @@ fn load_config(ini_file: Option<PathBuf>) -> Result<Ini, Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() {
-    let usage = { cli::app().render_usage() };
-    let matches = cli::app().get_matches();
+    let matches = match cli::app().try_get_matches() {
+        Ok(matches) => matches,
+        Err(error) => {
+            use clap::error::ErrorKind;
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) {
+                error.exit();
+            }
+            // clap diagnostics can include raw argv (including paths and tokens).
+            let message = match error.kind() {
+                ErrorKind::ArgumentConflict => "Some arguments cannot be used with each other",
+                ErrorKind::InvalidValue => {
+                    "Invalid or missing option value (check options such as --oauth-token)"
+                }
+                ErrorKind::MissingRequiredArgument => "Missing required app selection or OUTPATH",
+                _ => "Invalid command-line arguments; see --help",
+            };
+            eprintln!("{message}");
+            std::process::exit(2);
+        }
+    };
 
     let mut download_source = *matches
         .get_one::<DownloadSource>("download_source")
@@ -331,19 +365,13 @@ async fn main() {
         } else if download_source == DownloadSource::RuStore {
             eprintln!("RuStore: {message}");
         } else {
-            println!("{}\n\n{}", usage, message);
+            eprintln!("{message}");
         }
     };
     let list: Vec<(String, Option<String>)> = if oauth_token.is_none() {
         match matches.get_one::<String>("app") {
             Some(app) => {
-                let mut app_vec: Vec<String> = app.splitn(2, '@').map(String::from).collect();
-                let app_id = app_vec.remove(0);
-                let app_version = match app_vec.len() {
-                    1 => Some(app_vec.remove(0)),
-                    _ => None,
-                };
-                vec![(app_id, app_version)]
+                vec![single_app(app)]
             }
             None => {
                 let csv = matches.get_one::<String>("csv").unwrap();
@@ -366,7 +394,7 @@ async fn main() {
                 match fetch_csv_list(csv, field, version_field) {
                     Ok(csv_list) => csv_list,
                     Err(err) => {
-                        input_error(&format!("{:?}", err));
+                        input_error(&err.to_string());
                         std::process::exit(1);
                     }
                 }
@@ -413,7 +441,9 @@ async fn main() {
                 }
             }
             DownloadSource::RuStore => {
-                rustore::list_versions(list).await;
+                if !rustore::list_versions(list).await {
+                    std::process::exit(1);
+                }
             }
         }
     } else {
@@ -433,10 +463,7 @@ async fn main() {
         let outpath = matches.get_one::<String>("OUTPATH").map_or_else(
             || {
                 if oauth_token.is_none() {
-                    println!(
-                        "{}\n\nOUTPATH must be specified when downloading files",
-                        usage
-                    );
+                    input_error("OUTPATH must be specified when downloading files");
                     std::process::exit(1);
                 }
                 None
@@ -449,7 +476,7 @@ async fn main() {
                     } else if download_source == DownloadSource::RuStore {
                         eprintln!("RuStore: OUTPATH is not a valid directory");
                     } else {
-                        println!("{}\n\nOUTPATH is not a valid directory", usage);
+                        input_error("OUTPATH is not a valid directory");
                     }
                     std::process::exit(1);
                 }

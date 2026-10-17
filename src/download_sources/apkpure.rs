@@ -26,7 +26,7 @@ fn failure(message: &str) -> bool {
 }
 
 fn metadata_client() -> Result<Client, &'static str> {
-    Client::builder()
+    tokio_dl_stream_to_disk::public_http_client_builder()
         .connect_timeout(Duration::from_secs(10))
         .timeout(METADATA_TIMEOUT)
         .build()
@@ -83,12 +83,15 @@ fn versions_url(app_id: &str) -> Result<Url, &'static str> {
     if !safe_package(app_id) {
         return Err("invalid package component");
     }
-    Url::parse(&format!(
+    let url = Url::parse(&format!(
         "{}{}",
         crate::consts::APKPURE_VERSIONS_URL_FORMAT,
         app_id
     ))
-    .map_err(|_| "could not construct metadata URL")
+    .map_err(|_| "could not construct metadata URL")?;
+    tokio_dl_stream_to_disk::validate_public_url(&url)
+        .map_err(|_| "metadata endpoint is not public HTTP(S)")?;
+    Ok(url)
 }
 
 fn safe_package(value: &str) -> bool {
@@ -182,6 +185,12 @@ fn http_headers(options: &HashMap<&str, &str>) -> HeaderMap {
 // override or an environment-controlled endpoint.
 type Endpoint<'a> = &'a dyn Fn(&str) -> Result<Url, &'static str>;
 
+struct DownloadTransport<'a> {
+    metadata: &'a Client,
+    endpoint: Endpoint<'a>,
+    artifact: Option<&'a Client>,
+}
+
 async fn request_metadata(
     client: &Client,
     endpoint: Endpoint<'_>,
@@ -212,8 +221,11 @@ pub async fn download_apps(
                 sleep_duration,
                 outpath,
                 options,
-                &client,
-                &versions_url,
+                DownloadTransport {
+                    metadata: &client,
+                    endpoint: &versions_url,
+                    artifact: None,
+                },
             )
             .await
         }
@@ -227,9 +239,13 @@ async fn download_apps_using(
     sleep_duration: u64,
     outpath: &Path,
     options: HashMap<&str, &str>,
-    client: &Client,
-    endpoint: Endpoint<'_>,
+    transport: DownloadTransport<'_>,
 ) -> bool {
+    let DownloadTransport {
+        metadata: client,
+        endpoint,
+        artifact: injected_artifact_client,
+    } = transport;
     if !matches!(options.get("acknowledge_dangers"), Some(value) if *value == "1" || value.eq_ignore_ascii_case("true"))
     {
         return failure("the dangers of this source must be explicitly acknowledged: https://github.com/EFForg/apkeep/blob/master/USAGE-apkpure.md");
@@ -262,7 +278,7 @@ async fn download_apps_using(
                 Err(message) => return failure(message),
             };
             let re = download_regex(version.as_deref());
-            download_from_response(response, &re, name, outpath, mp).await
+            download_from_response(response, &re, name, outpath, mp, injected_artifact_client).await
         }
     }))
     .buffer_unordered(parallel)
@@ -278,6 +294,7 @@ async fn download_from_response(
     app_string: String,
     outpath: &Path,
     mp: Rc<MultiProgress>,
+    injected_client: Option<&Client>,
 ) -> bool {
     if !safe_output_name(&app_string) {
         return failure("invalid app, version or architecture component");
@@ -298,25 +315,25 @@ async fn download_from_response(
         "apk"
     };
     let fname = format!("{app_string}.{extension}");
-    // A pre-existing regular file is a compatible skip, not revalidation.
-    // Symlinks and directories must never be reported as a successful skip.
+    // No trusted digest is available here: never bless pre-existing bytes.
     let destination = outpath.join(&fname);
     match std::fs::symlink_metadata(&destination) {
         Ok(meta) if meta.file_type().is_file() => {
-            mp.suspend(|| println!("File already exists for {app_string}. Skipping..."));
-            return true;
+            return failure(
+                "output already exists and is unverified; use a fresh output directory",
+            );
         }
         Ok(_) => return failure("destination exists and is not a regular file"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return failure("could not inspect destination"),
     }
     for attempt in 1..=3 {
-        let mut dl = match timeout(
-            METADATA_TIMEOUT,
-            AsyncDownload::new(download_url.as_str(), outpath, &fname).get(),
-        )
-        .await
-        {
+        let download = AsyncDownload::new(download_url.as_str(), outpath, &fname);
+        let download = match injected_client {
+            Some(client) => download.with_client(client.clone()),
+            None => download,
+        };
+        let mut dl = match timeout(METADATA_TIMEOUT, download.get()).await {
             Ok(Ok(dl)) => dl,
             _ => return failure("invalid artifact response or request timeout"),
         };
@@ -329,11 +346,9 @@ async fn download_from_response(
                 return true;
             }
             Ok(Err(err)) if matches!(err.kind(), TDSTDErrorKind::FileExists) => {
-                if std::fs::symlink_metadata(&destination).is_ok_and(|m| m.file_type().is_file()) {
-                    mp.suspend(|| println!("File already exists for {app_string}. Skipping..."));
-                    return true;
-                }
-                return failure("destination is not a regular file");
+                return failure(
+                    "destination appeared during publication and is unverified; not retrying",
+                );
             }
             Ok(Err(err)) if matches!(err.kind(), TDSTDErrorKind::PermissionDenied) => {
                 return failure("permission denied writing artifact");

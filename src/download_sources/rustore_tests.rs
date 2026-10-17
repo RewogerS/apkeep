@@ -1,4 +1,129 @@
 use super::*;
+
+#[tokio::test]
+async fn non_success_artifact_responses_never_publish_body() {
+    for headers in ["", "Location: file:///not-read\r\n"] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let reply = format!("HTTP/1.1 302 Found\r\n{headers}Content-Length: 3\r\nConnection: close\r\n\r\nbad");
+                socket.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        let out = tempfile::tempdir().unwrap();
+        let result = injected_download_apk(
+            url,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new()),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+        assert!(
+            !result,
+            "a stopped 302 body must not be reported as a downloaded APK"
+        );
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn production_artifact_and_metadata_paths_reject_private_initial_urls() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local = format!(
+        "http://{}/private?token=PRIVATE_TOKEN",
+        listener.local_addr().unwrap()
+    );
+    let out = tempfile::tempdir().unwrap();
+    for url in [
+        local.as_str(),
+        "http://169.254.169.254/private",
+        "http://[::1]/private",
+        "http://user:PRIVATE_TOKEN@example.com/private",
+    ] {
+        assert!(!tokio::time::timeout(
+            TokioDuration::from_millis(500),
+            download_apk(
+                url.into(),
+                "com.example.app".into(),
+                out.path(),
+                Rc::new(MultiProgress::new())
+            )
+        )
+        .await
+        .expect("private URL must fail before network"));
+    }
+    assert!(
+        !download_apps_at(
+            vec![("com.example.app".into(), None)],
+            1,
+            0,
+            out.path(),
+            HashMap::from([("rustore_version", "11500")]),
+            (&local, &local),
+            None
+        )
+        .await
+    );
+    assert!(
+        tokio::time::timeout(TokioDuration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+async fn injected_download_apk(
+    url: String,
+    name: String,
+    out: &Path,
+    mp: Rc<MultiProgress>,
+) -> bool {
+    injected_download_apk_with_policy(url, name, out, mp, NetworkPolicy::default()).await
+}
+async fn injected_download_apk_with_policy(
+    url: String,
+    name: String,
+    out: &Path,
+    mp: Rc<MultiProgress>,
+    policy: NetworkPolicy,
+) -> bool {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(policy.connect)
+        .read_timeout(policy.idle_read)
+        .timeout(policy.apk_total)
+        .build()
+        .unwrap();
+    download_apk_with_policy(url, name, out, mp, policy, Some(&client)).await
+}
+
+#[tokio::test]
+async fn production_client_denies_loopback_dns_before_connecting() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://localhost:{}/private?token=PRIVATE_TOKEN",
+        listener.local_addr().unwrap().port()
+    );
+    let client = network_client(NetworkPolicy::default(), TokioDuration::from_millis(80)).unwrap();
+    let _ = client
+        .get(url)
+        .timeout(TokioDuration::from_millis(80))
+        .send()
+        .await;
+    assert!(
+        tokio::time::timeout(TokioDuration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "production client connected to loopback"
+    );
+}
+
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -44,7 +169,7 @@ async fn assert_apk_stall_is_bounded(prefix: &str, policy: NetworkPolicy, observ
     let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
     let download = tokio::time::timeout(
         TokioDuration::from_millis(800),
-        download_apk_with_policy(
+        injected_download_apk_with_policy(
             endpoint,
             "com.example.app".into(),
             out.path(),
@@ -145,7 +270,7 @@ async fn assert_apk_oversize_is_rejected_early(prefix: &str) {
     let (endpoint, task, attempts) = serve_counted_held_response(prefix.into()).await;
     let result = tokio::time::timeout(
         TokioDuration::from_millis(400),
-        download_apk_with_policy(
+        injected_download_apk_with_policy(
             endpoint,
             "com.example.app".into(),
             out.path(),
@@ -316,7 +441,7 @@ async fn exact_resource_caps_accept_complete_declared_and_streamed_bodies() {
         let (endpoint, task) = serve_raw_response(response(apk)).await;
         let out = tempfile::tempdir().unwrap();
         assert!(
-            download_apk_with_policy(
+            injected_download_apk_with_policy(
                 endpoint,
                 "com.example.app".into(),
                 out.path(),
@@ -379,10 +504,67 @@ fn network_policy_diagnostics_are_redacted_on_actual_stdout_and_stderr() {
 }
 
 #[tokio::test]
+async fn publication_race_is_nonretryable_and_never_trusts_the_winner() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+    let count = Arc::new(AtomicUsize::new(0));
+    let seen = count.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            seen.fetch_add(1, Ordering::SeqCst);
+            read_request(&mut socket).await;
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\na")
+                .await
+                .unwrap();
+            sleep(TokioDuration::from_millis(60)).await;
+            let _ = socket.write_all(b"bc").await;
+        }
+    });
+    let out = tempfile::tempdir().unwrap();
+    let target = out.path().join("com.example.app.apk");
+    let (result, ()) = tokio::join!(
+        injected_download_apk(
+            url,
+            "com.example.app".into(),
+            out.path(),
+            Rc::new(MultiProgress::new())
+        ),
+        async {
+            tokio::time::timeout(TokioDuration::from_secs(1), async {
+                while !std::fs::read_dir(out.path())
+                    .unwrap()
+                    .any(|entry| entry.unwrap().metadata().unwrap().len() > 0)
+                {
+                    sleep(TokioDuration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::write(&target, b"untrusted winner").unwrap();
+        }
+    );
+    server.abort();
+    assert!(!result);
+    assert_eq!(
+        count.load(Ordering::SeqCst),
+        1,
+        "publication failure must not re-download"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"untrusted winner");
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
+}
+
+#[tokio::test]
 async fn apk_download_returns_its_actual_success() {
     let out = tempfile::tempdir().unwrap();
     let (endpoint, task) = serve_once("200 OK", "test-apk-bytes").await;
-    let result = download_apk(
+    let result = injected_download_apk(
         endpoint,
         "com.example.app".to_string(),
         out.path(),
@@ -423,6 +605,7 @@ async fn batch_reports_failed_apk_transfer() {
             out.path(),
             HashMap::from([("rustore_version", "11500")]),
             (&lookup, &link),
+            Some((&local_client(), &local_client())),
         ),
     )
     .await
@@ -439,7 +622,7 @@ async fn unsafe_package_cannot_escape_the_output_directory() {
     let out = root.path().join("output");
     std::fs::create_dir(&out).unwrap();
     let (endpoint, task) = serve_once("200 OK", "test-apk-bytes").await;
-    let result = download_apk(
+    let result = injected_download_apk(
         endpoint,
         "../escaped".into(),
         &out,
@@ -643,6 +826,7 @@ async fn loopback_batch_fixture() {
         out.path(),
         HashMap::from([("rustore_version", "11500")]),
         (&format!("{base}/lookup"), &format!("{base}/link")),
+        Some((&local_client(), &local_client())),
     )
     .await;
     println!("BATCH_RESULT={result}");
@@ -714,7 +898,7 @@ async fn existing_symlink_is_not_a_successful_apk() {
     std::fs::write(&target, "unchanged").unwrap();
     let destination = out.path().join("com.example.app.apk");
     std::os::unix::fs::symlink(&target, &destination).unwrap();
-    let result = download_apk(
+    let result = injected_download_apk(
         "http://127.0.0.1:1/secret-path".into(),
         "com.example.app".into(),
         out.path(),
@@ -733,7 +917,7 @@ async fn existing_symlink_is_not_a_successful_apk() {
 async fn empty_apk_response_is_a_failed_download() {
     let out = tempfile::tempdir().unwrap();
     let (endpoint, task) = serve_once("200 OK", "").await;
-    let result = download_apk(
+    let result = injected_download_apk(
         endpoint,
         "com.example.app".into(),
         out.path(),
@@ -747,6 +931,8 @@ async fn empty_apk_response_is_a_failed_download() {
 
 #[test]
 fn package_validation_rejects_paths_queries_and_control_characters() {
+    assert!(valid_package_name(&"a".repeat(240)));
+    assert!(!valid_package_name(&"a".repeat(241)));
     for package in [
         "../escape",
         "/absolute",
@@ -775,12 +961,12 @@ fn package_validation_rejects_paths_queries_and_control_characters() {
 }
 
 #[tokio::test]
-async fn existing_regular_file_is_preserved_as_a_successful_skip() {
+async fn existing_regular_file_is_preserved_but_not_trusted() {
     let out = tempfile::tempdir().unwrap();
     let destination = out.path().join("com.example.app.apk");
     std::fs::write(&destination, "existing-apk").unwrap();
     assert!(
-        download_apk(
+        !injected_download_apk(
             "not-a-url".into(),
             "com.example.app".into(),
             out.path(),

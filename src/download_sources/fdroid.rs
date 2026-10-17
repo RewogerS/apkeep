@@ -19,7 +19,7 @@ use sha2::Sha256;
 use simple_error::SimpleError;
 use tempfile::{tempdir, TempDir};
 use tokio::time::{sleep, Duration};
-use tokio_dl_stream_to_disk::AsyncDownload;
+use tokio_dl_stream_to_disk::{public_http_client_builder, validate_public_url, AsyncDownload};
 use x509_certificate::certificate::CapturedX509Certificate;
 
 use crate::config;
@@ -37,10 +37,11 @@ async fn retrieve_index(
     options: &HashMap<&str, &str>,
     mp: Rc<MultiProgress>,
     output_format: OutputFormat,
+    client: Option<&reqwest::Client>,
 ) -> Result<Value, Box<dyn Error>> {
     let config_dir = config::config_dir()
         .map_err(|_| SimpleError::new("F-Droid cache directory unavailable."))?;
-    retrieve_index_using_cache(options, mp, output_format, &config_dir).await
+    retrieve_index_using_cache(options, mp, output_format, &config_dir, client).await
 }
 
 async fn retrieve_index_using_cache(
@@ -48,6 +49,7 @@ async fn retrieve_index_using_cache(
     mp: Rc<MultiProgress>,
     output_format: OutputFormat,
     config_dir: &Path,
+    client: Option<&reqwest::Client>,
 ) -> Result<Value, Box<dyn Error>> {
     // Reverify the signed archive on every cache hit. Never reuse the old
     // unsigned JSON cache, shared with verify-index=false and different pins.
@@ -59,7 +61,8 @@ async fn retrieve_index_using_cache(
     validate_output_directory(&cache_dir)?;
     let cache_name = hex::encode(Sha256::digest(format!("{repo}:{use_entry}")));
     let cache = cache_dir.join(cache_name);
-    let etag = download_repository_archive(&temp_dir, &repo, use_entry, Some(&cache)).await?;
+    let etag =
+        download_repository_archive(&temp_dir, &repo, use_entry, Some(&cache), client).await?;
     let files = extract_archive(&temp_dir, &temp_dir.path().join("jar.zip"))?;
     let json = verify_and_return_json(
         &temp_dir,
@@ -70,8 +73,16 @@ async fn retrieve_index_using_cache(
         Rc::clone(&mp),
     )?;
     let index = if use_entry {
-        verify_and_return_index_from_entry(&temp_dir, &repo, &json, verify_index, mp, output_format)
-            .await?
+        verify_and_return_index_from_entry(
+            &temp_dir,
+            &repo,
+            &json,
+            verify_index,
+            mp,
+            output_format,
+            client,
+        )
+        .await?
     } else {
         json
     };
@@ -171,6 +182,17 @@ pub async fn download_apps(
     outpath: &Path,
     options: HashMap<&str, &str>,
 ) -> bool {
+    download_apps_with_client(apps, parallel, sleep_duration, outpath, options, None).await
+}
+
+async fn download_apps_with_client(
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep_duration: u64,
+    outpath: &Path,
+    options: HashMap<&str, &str>,
+    client: Option<&reqwest::Client>,
+) -> bool {
     let (apps, all_valid) = valid_requests(apps);
     if options
         .get("arch")
@@ -188,15 +210,20 @@ pub async fn download_apps(
         return false;
     }
     let mp = Rc::new(MultiProgress::new());
-    let index = match retrieve_index(&options, Rc::clone(&mp), OutputFormat::Plaintext).await {
-        Ok(index) => index,
-        Err(err) => {
-            eprintln!(
-                "Could not retrieve verified F-Droid package index: {}",
-                safe_error_summary(err.as_ref())
-            );
-            return false;
-        }
+    let index =
+        match retrieve_index(&options, Rc::clone(&mp), OutputFormat::Plaintext, client).await {
+            Ok(index) => index,
+            Err(err) => {
+                eprintln!(
+                    "Could not retrieve verified F-Droid package index: {}",
+                    safe_error_summary(err.as_ref())
+                );
+                return false;
+            }
+        };
+    let repo = match repository_options(&options) {
+        Ok((repo, _, _, _)) => repo,
+        Err(_) => return false,
     };
     let downloaded = download_from_index(
         index,
@@ -205,7 +232,11 @@ pub async fn download_apps(
         sleep_duration,
         outpath,
         options.get("arch").map(|value| value.to_string()),
-        mp,
+        RepositoryDownload {
+            repo: &repo,
+            client,
+            progress: mp,
+        },
     )
     .await;
     downloaded && all_valid
@@ -227,6 +258,12 @@ fn valid_requests(apps: Vec<(String, Option<String>)>) -> (Vec<(String, Option<S
     (apps, all_valid)
 }
 
+struct RepositoryDownload<'a> {
+    repo: &'a str,
+    client: Option<&'a reqwest::Client>,
+    progress: Rc<MultiProgress>,
+}
+
 async fn download_from_index(
     index: Value,
     apps: Vec<(String, Option<String>)>,
@@ -234,8 +271,20 @@ async fn download_from_index(
     sleep_duration: u64,
     outpath: &Path,
     arch: Option<String>,
-    mp: Rc<MultiProgress>,
+    repository: RepositoryDownload<'_>,
 ) -> bool {
+    let RepositoryDownload {
+        repo: configured_repo,
+        client,
+        progress: mp,
+    } = repository;
+    // Architecture is common to this batch. Collapse identical app/version
+    // requests before counting selections or spawning jobs for the same path.
+    let mut seen = HashSet::new();
+    let apps: Vec<_> = apps
+        .into_iter()
+        .filter(|app| seen.insert(app.clone()))
+        .collect();
     let requested = apps.len();
     if requested == 0 {
         eprintln!("No F-Droid applications requested.");
@@ -245,7 +294,10 @@ async fn download_from_index(
         eprintln!("F-Droid output path: {}", safe_error_summary(err.as_ref()));
         return false;
     }
-    let (jobs, repo) =
+    // An index may advertise its canonical origin, but it is not routing
+    // authority: both metadata and APK requests stay on the configured mirror.
+    let repo = configured_repo.to_owned();
+    let (jobs, _advertised_repo) =
         match parse_json_for_download_information(index, apps, arch.clone(), Rc::clone(&mp)) {
             Ok(info) => info,
             Err(err) => {
@@ -285,7 +337,7 @@ async fn download_from_index(
                     // Existing regular files are successful skips only when the
                     // complete expected digest matches. Symlinks are never skips.
                     let ok = if metadata.file_type().is_file() {
-                        match file_matches_sha256(&target, &hash) {
+                        match file_matches_sha256(&target, &hash).await {
                             Ok(matches) => matches,
                             Err(err) => {
                                 eprintln!(
@@ -327,7 +379,10 @@ async fn download_from_index(
             );
             for attempt in 1..=3 {
                 let transfer = async {
-                    let mut dl = AsyncDownload::new(&url, outpath, &filename).get().await?;
+                    let download = AsyncDownload::new(&url, outpath, &filename)
+                        .with_max_bytes(MAX_APK_BYTES)
+                        .with_client(http_client_for_url(&url, client)?);
+                    let mut dl = download.get().await?;
                     let cb = dl
                         .length()
                         .map(|length| progress_wrapper(Rc::clone(&mp))(filename.clone(), length));
@@ -357,14 +412,59 @@ async fn download_from_index(
     complete_selection && !outcomes.is_empty() && outcomes.into_iter().all(|ok| ok)
 }
 
-fn file_matches_sha256(path: &Path, expected: &[u8]) -> Result<bool, io::Error> {
-    let mut file = File::open(path)?;
+async fn file_matches_sha256(path: &Path, expected: &[u8]) -> Result<bool, io::Error> {
+    file_matches_sha256_bounded(path, expected, MAX_APK_BYTES, REQUEST_TIMEOUT).await
+}
+
+async fn file_matches_sha256_bounded(
+    path: &Path,
+    expected: &[u8],
+    limit: u64,
+    deadline: Duration,
+) -> Result<bool, io::Error> {
+    tokio::time::timeout(deadline, async {
+        let mut file = tokio::fs::File::open(path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Existing APK exceeds size policy.",
+            ));
+        }
+        hash_reader_matches(&mut file, expected, limit).await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Existing APK verification timed out.",
+        )
+    })?
+}
+
+async fn hash_reader_matches<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    expected: &[u8],
+    limit: u64,
+) -> Result<bool, io::Error> {
+    use tokio::io::AsyncReadExt;
+    // Size precheck alone is insufficient if a regular file grows while read.
+    // Consume at most limit + 1 bytes with a fixed 8 KiB buffer.
+    let mut reader = reader.take(limit.saturating_add(1));
     let mut hasher = Sha256::new();
+    let mut received = 0u64;
     let mut buffer = [0; 8192];
     loop {
-        let length = file.read(&mut buffer)?;
+        let length = reader.read(&mut buffer).await?;
         if length == 0 {
             break;
+        }
+        received += length as u64;
+        if received > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Existing APK exceeds size policy.",
+            ));
         }
         hasher.update(&buffer[..length]);
     }
@@ -414,7 +514,19 @@ fn parse_json_for_download_information(
             }
             match packages.get(&app_id) {
                 Some(Value::Array(app_array)) => {
-                    for single_app in app_array {
+                    let mut candidates: Vec<&Value> = app_array.iter().collect();
+                    if app_version.is_none() {
+                        candidates.retain(|candidate| {
+                            candidate
+                                .get("versionCode")
+                                .and_then(Value::as_u64)
+                                .is_some()
+                        });
+                        candidates.sort_by_key(|candidate| {
+                            std::cmp::Reverse(candidate["versionCode"].as_u64().unwrap_or(0))
+                        });
+                    }
+                    for single_app in candidates {
                         if let Value::Object(fdroid_app) = single_app {
                             if let Some(Value::String(version_name)) = fdroid_app.get("versionName")
                             {
@@ -567,6 +679,14 @@ pub async fn list_versions(
     apps: Vec<(String, Option<String>)>,
     options: HashMap<&str, &str>,
 ) -> bool {
+    list_versions_with_client(apps, options, None).await
+}
+
+async fn list_versions_with_client(
+    apps: Vec<(String, Option<String>)>,
+    options: HashMap<&str, &str>,
+    client: Option<&reqwest::Client>,
+) -> bool {
     let (apps, all_valid) = valid_requests(apps);
     let output_format = if options
         .get("output_format")
@@ -584,6 +704,7 @@ pub async fn list_versions(
         &options,
         Rc::new(MultiProgress::new()),
         output_format.clone(),
+        client,
     )
     .await
     {
@@ -876,6 +997,7 @@ async fn verify_and_return_index_from_entry(
     verify_index: bool,
     _mp: Rc<MultiProgress>,
     _output_format: OutputFormat,
+    client: Option<&reqwest::Client>,
 ) -> Result<String, Box<dyn Error>> {
     let entry: Value = serde_json::from_str(json)?;
     let index = entry.get("index").ok_or(FDroidError::Dummy)?;
@@ -915,15 +1037,34 @@ async fn verify_and_return_index_from_entry(
         hash.as_deref(),
         MAX_METADATA_BYTES,
         REQUEST_TIMEOUT,
+        client,
     )
     .await?;
     read_bounded_string(&dir.path().join(index_name), MAX_METADATA_BYTES)
 }
 
+const MAX_APK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+// A caller-supplied client is an explicit trusted transport seam, used by
+// loopback fixtures only. Production entry points always pass None. Initial
+// URLs need validation as literal IPs never reach reqwest's DNS resolver.
+fn http_client_for_url(
+    url: &str,
+    injected: Option<&reqwest::Client>,
+) -> Result<reqwest::Client, Box<dyn Error>> {
+    if let Some(client) = injected {
+        return Ok(client.clone());
+    }
+    validate_public_url(&reqwest::Url::parse(url)?)?;
+    Ok(public_http_client_builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
 
 fn safe_component(value: &str) -> bool {
     !value.is_empty()
@@ -967,6 +1108,7 @@ async fn download_metadata(
     expected: Option<&[u8]>,
     limit: u64,
     deadline: Duration,
+    client: Option<&reqwest::Client>,
 ) -> Result<(), Box<dyn Error>> {
     if !safe_repo_name(name) {
         return Err(Box::new(SimpleError::new("Invalid F-Droid metadata path.")));
@@ -979,52 +1121,28 @@ async fn download_metadata(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(FDroidError::Dummy)?;
-    let exceeded = Rc::new(std::cell::Cell::new(false));
-    let notify = Rc::new(tokio::sync::Notify::new());
-    let signal = Rc::clone(&notify);
-    let flag = Rc::clone(&exceeded);
-    let cb: Option<Box<dyn Fn(u64)>> = Some(Box::new(move |count| {
-        if count > limit {
-            flag.set(true);
-            signal.notify_one();
-        }
-    }));
     let download = async {
-        let mut dl = AsyncDownload::new(url, parent, leaf).get().await?;
+        let download = AsyncDownload::new(url, parent, leaf)
+            .with_max_bytes(limit)
+            .with_client(http_client_for_url(url, client)?);
+        let mut dl = download.get().await?;
         if dl.length().is_some_and(|length| length > limit) {
             return Err::<(), Box<dyn Error>>(Box::new(SimpleError::new(
                 "F-Droid metadata exceeds size limit.",
             )));
         }
         if let Some(expected) = expected {
-            dl.download_and_verify_sha256(expected, &cb)
+            dl.download_and_verify_sha256(expected, &None)
                 .await
                 .map_err(|_| SimpleError::new("Index SHA256-verified transfer failed."))?;
         } else {
-            dl.download(&cb)
+            dl.download(&None)
                 .await
                 .map_err(|_| SimpleError::new("Index transfer failed."))?;
         }
         Ok(())
     };
-    let result = tokio::time::timeout(deadline, async {
-        tokio::select! {
-            biased;
-            _ = notify.notified() => Err(Box::new(SimpleError::new("F-Droid metadata exceeds size limit.")) as Box<dyn Error>),
-            result = download => result,
-        }
-    }).await?;
-    if exceeded.get() {
-        // The callback can fire on the last chunk. Even if the download future
-        // wins that poll, an oversized metadata file is never used.
-        if fs::symlink_metadata(&target).is_ok() {
-            fs::remove_file(&target)?;
-        }
-        return Err(Box::new(SimpleError::new(
-            "F-Droid metadata exceeds size limit.",
-        )));
-    }
-    result
+    tokio::time::timeout(deadline, download).await?
 }
 
 fn validate_output_directory(path: &Path) -> Result<(), Box<dyn Error>> {
@@ -1094,6 +1212,7 @@ async fn download_repository_archive(
     repo: &str,
     use_entry: bool,
     cache: Option<&Path>,
+    client: Option<&reqwest::Client>,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let url = format!(
         "{}/{}",
@@ -1104,10 +1223,7 @@ async fn download_repository_archive(
             "index-v1.jar"
         }
     );
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()?;
+    let client = http_client_for_url(&url, client)?;
     let mut request = client.get(&url);
     if let Some(cache) = cache {
         let jar = cache.with_extension("jar");
@@ -1131,6 +1247,13 @@ async fn download_repository_archive(
         return Ok(None);
     }
     let response = response.error_for_status()?;
+    // error_for_status alone accepts stopped redirects (3xx). Only the cache
+    // branch above may accept 304; reject every other non-success before output.
+    if !response.status().is_success() {
+        return Err(Box::new(SimpleError::new(
+            "F-Droid repository archive returned a non-success HTTP status.",
+        )));
+    }
     let etag = response
         .headers()
         .get(reqwest::header::ETAG)
