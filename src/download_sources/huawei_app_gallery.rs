@@ -1,5 +1,9 @@
 //! Huawei AppGallery support for the latest APK offered to the configured client profile.
 
+#[path = "apk_validation.rs"]
+mod apk_validation;
+use crate::results::{self, Reason, Status};
+
 pub fn region(options: Option<&str>) -> Result<String, &'static str> {
     match options {
         None => Ok("IE".to_owned()),
@@ -69,6 +73,7 @@ struct Apk {
     url: reqwest::Url,
     size: u64,
     sha256: Vec<u8>,
+    version_code: Option<u64>,
 }
 
 fn parse_apk(body: &[u8], package: &str) -> Result<Apk, &'static str> {
@@ -81,6 +86,7 @@ fn parse_apk(body: &[u8], package: &str) -> Result<Apk, &'static str> {
     }
     let list = value["list"].as_array().ok_or("malformed API list")?;
     if list.is_empty() {
+        results::note(Status::Unavailable, Reason::ProfileUnavailable);
         return Err("unavailable in configured region/profile");
     }
     let mut matching = list
@@ -121,6 +127,16 @@ fn parse_apk(body: &[u8], package: &str) -> Result<Apk, &'static str> {
         url: apk_url(raw_url)?,
         size,
         sha256,
+        // Real client.updateCheck responses supply numeric versionCode; older
+        // responses can omit it. Never manufacture an expected version.
+        version_code: item
+            .get("versionCode")
+            .map(|v| {
+                v.as_u64()
+                    .filter(|v| *v > 0 && *v <= i64::MAX as u64)
+                    .ok_or("invalid API versionCode")
+            })
+            .transpose()?,
     })
 }
 
@@ -170,6 +186,7 @@ fn apk_url(raw: &str) -> Result<reqwest::Url, &'static str> {
 // Private transport seam. Production batch always passes public_only=true and
 // the shared guarded client; loopback fixtures explicitly inject their client
 // and disable only the initial-URL guard. No CLI/environment policy switch exists.
+#[cfg(test)]
 async fn download_one(
     client: &reqwest::Client,
     endpoint: &str,
@@ -179,22 +196,62 @@ async fn download_one(
     outpath: &std::path::Path,
     public_only: bool,
 ) -> Result<(), String> {
+    let output = tokio_dl_stream_to_disk::OutputDirectory::open(outpath)
+        .map_err(|_| "unsafe output directory")?;
+    download_one_pinned(
+        client,
+        endpoint,
+        package,
+        version,
+        region,
+        &output,
+        public_only,
+    )
+    .await
+}
+
+async fn download_one_pinned(
+    client: &reqwest::Client,
+    endpoint: &str,
+    package: &str,
+    version: Option<&str>,
+    region: &str,
+    output: &tokio_dl_stream_to_disk::OutputDirectory,
+    public_only: bool,
+) -> Result<(), String> {
+    let outpath = output.path();
     use std::io::Write;
+    results::note(Status::Error, Reason::Integrity);
     if !valid_package(package) {
-        return Err("invalid package ID".to_owned());
+        return Err(results::error(
+            "invalid package ID".to_owned(),
+            Reason::InvalidInput,
+        ));
     }
     if version.is_some() {
+        results::note(Status::Unavailable, Reason::VariantUnavailable);
         return Err("historical versions are unsupported".to_owned());
     }
     match std::fs::symlink_metadata(outpath.join(format!("{package}.apk"))) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            return Err(
+            return Err(results::error(
                 "output already exists and is unverified; use a fresh output directory".to_owned(),
-            )
+                Reason::LocalIo,
+            ))
         }
-        Ok(_) => return Err("output exists but is not a regular file".to_owned()),
+        Ok(_) => {
+            return Err(results::error(
+                "output exists but is not a regular file".to_owned(),
+                Reason::LocalIo,
+            ))
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return Err("cannot inspect existing output".to_owned()),
+        Err(_) => {
+            return Err(results::error(
+                "cannot inspect existing output".to_owned(),
+                Reason::LocalIo,
+            ))
+        }
     }
     if public_only {
         let url = reqwest::Url::parse(endpoint).map_err(|_| "invalid API endpoint")?;
@@ -216,6 +273,14 @@ async fn download_one(
         .await
         .map_err(|error| network_error("API", &error))?;
     if response.status() != reqwest::StatusCode::OK {
+        results::note(
+            Status::Error,
+            if matches!(response.status().as_u16(), 401 | 403) {
+                Reason::Authentication
+            } else {
+                Reason::Transport
+            },
+        );
         return Err(format!("API HTTP status {}", response.status().as_u16()));
     }
     let mut body = Vec::new();
@@ -243,13 +308,21 @@ async fn download_one(
         .await
         .map_err(|error| network_error("APK", &error))?;
     if response.status() != reqwest::StatusCode::OK {
+        results::note(
+            Status::Error,
+            if matches!(response.status().as_u16(), 401 | 403) {
+                Reason::Authentication
+            } else {
+                Reason::Transport
+            },
+        );
         return Err(format!("APK HTTP status {}", response.status().as_u16()));
     }
     use sha2::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut size = 0u64;
-    let mut file =
-        tempfile::NamedTempFile::new_in(outpath).map_err(|_| "cannot create temporary APK")?;
+    let mut file = tempfile::NamedTempFile::new_in(outpath)
+        .map_err(|_| results::error("cannot create temporary APK", Reason::LocalIo))?;
     while let Some(chunk) = response
         .chunk()
         .await
@@ -263,7 +336,7 @@ async fn download_one(
         }
         hash.update(&chunk);
         file.write_all(&chunk)
-            .map_err(|_| "cannot write temporary APK")?;
+            .map_err(|_| results::error("cannot write temporary APK", Reason::LocalIo))?;
     }
     if size != apk.size {
         return Err("APK size does not match API metadata".to_owned());
@@ -271,15 +344,30 @@ async fn download_one(
     if hash.finalize().as_slice() != apk.sha256 {
         return Err("APK SHA256 does not match API metadata".to_owned());
     }
+    apk_validation::validate(file.as_file_mut(), package, apk.version_code)?;
     file.as_file()
         .sync_all()
-        .map_err(|_| "cannot sync temporary APK")?;
+        .map_err(|_| results::error("cannot sync temporary APK", Reason::LocalIo))?;
     file.persist_noclobber(outpath.join(format!("{package}.apk")))
-        .map_err(|_| "cannot publish APK without overwriting existing output")?;
+        .map_err(|_| {
+            results::error(
+                "cannot publish APK without overwriting existing output",
+                Reason::LocalIo,
+            )
+        })?;
+    results::complete();
     Ok(())
 }
 
 fn network_error(stage: &str, error: &reqwest::Error) -> String {
+    results::note(
+        Status::Error,
+        if error.is_timeout() {
+            Reason::Timeout
+        } else {
+            Reason::Transport
+        },
+    );
     // Never format reqwest errors: they can contain signed URLs and response bodies.
     format!(
         "{stage} {}",
@@ -320,6 +408,7 @@ pub async fn download_apps(
     let client = match http_client_builder().build() {
         Ok(client) => client,
         Err(_) => {
+            results::batch_error(&apps, Reason::Transport);
             eprintln!("Huawei AppGallery: cannot initialize HTTP client");
             return false;
         }
@@ -359,21 +448,33 @@ async fn download_batch(
         public_only,
     } = transport;
     if parallel == 0 || apps.is_empty() {
+        results::batch_error(&apps, Reason::InvalidInput);
         eprintln!("Huawei AppGallery: nonempty app list and parallel >= 1 required");
         return false;
     }
+    let output = match tokio_dl_stream_to_disk::OutputDirectory::open(outpath) {
+        Ok(output) => output,
+        Err(_) => {
+            results::batch_error(&apps, Reason::LocalIo);
+            eprintln!("Huawei AppGallery: unsafe output directory");
+            return false;
+        }
+    };
+    let output = &output;
+    let mut seen = std::collections::HashSet::new();
     let results =
-        futures_util::stream::iter(apps.into_iter().map(|(package, version)| async move {
+        futures_util::stream::iter(apps.into_iter().filter(|item| seen.insert(item.clone())).map(|(package, version)| async move {
+          results::observe(&package, version.as_deref(), async {
             if sleep_duration > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(sleep_duration)).await;
             }
-            let result = download_one(
+            let result = download_one_pinned(
                 client,
                 endpoint,
                 &package,
                 version.as_deref(),
                 region,
-                outpath,
+                output,
                 public_only,
             )
             .await;
@@ -394,6 +495,7 @@ async fn download_batch(
                     false
                 }
             }
+          }).await
         }))
         .buffer_unordered(parallel)
         .collect::<Vec<_>>()
@@ -406,7 +508,21 @@ pub fn list_versions(apps: Vec<(String, Option<String>)>) -> bool {
     if !success {
         eprintln!("Huawei AppGallery: nonempty app list required");
     }
-    for (app, _) in apps {
+    for (app, version) in apps {
+        results::record(
+            &app,
+            version.as_deref(),
+            if valid_package(&app) {
+                Status::Unavailable
+            } else {
+                Status::Error
+            },
+            if valid_package(&app) {
+                Reason::Unsupported
+            } else {
+                Reason::InvalidInput
+            },
+        );
         if valid_package(&app) {
             println!("Huawei AppGallery does not expose historical versions ({app}).");
         } else {

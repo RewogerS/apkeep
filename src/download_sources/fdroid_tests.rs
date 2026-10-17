@@ -10,8 +10,147 @@ const FINGERPRINT: &str = "a865115a6025a69cb3e2b28f590513d32a6ec5d9d1b0a6ee4e1b0
 const SIGNATURE_B64: &str = "MIIE0gYJKoZIhvcNAQcCoIIEwzCCBL8CAQExDTALBglghkgBZQMEAgEwCwYJKoZIhvcNAQcBoIIDMTCCAy0wggIVoAMCAQICFBCjWbR9MMkv3MWsbKQDL7Es8jnWMA0GCSqGSIb3DQEBCwUAMCYxJDAiBgNVBAMMG2Fwa2VlcCBvZmZsaW5lIHRlc3QgZml4dHVyZTAeFw0yNjEwMTUyMTU3MjBaFw0zNjEwMTIyMTU3MjBaMCYxJDAiBgNVBAMMG2Fwa2VlcCBvZmZsaW5lIHRlc3QgZml4dHVyZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAN/BItmg1hxe7BjEPwhIm4LONGcGGJc2tCAh0+hwVTIN7SX/c8/bfAYrjzfOSrH5OBvZZ1ZjvNYQbZ/69qRkgXpBLm1bSrHft45F4dSidzcX8lpqUMIjvmUozIqHRLgr7X9ZJXxsD7YtQHi2vgou4fiJEM0wPGaPKtuJ1InVM9DIpp2OXf2BdaP5OeS/OqfwRhNUMya7APLRCReQG3CS013TXSHdIgVB8nhbcv+s0fIhLigIa0MiXdfG9EfIGVz5w2cMlPkCFhZPtDBC0JC3iBRgQa0AMMCTRw5oSwg3L9Au3tyEseuZORI13LLNjK997R32dcYmmj3kw+pnq3TAuQsCAwEAAaNTMFEwHQYDVR0OBBYEFCZ9RVVy+TKYVRWSAa61nO9NyJX4MB8GA1UdIwQYMBaAFCZ9RVVy+TKYVRWSAa61nO9NyJX4MA8GA1UdEwEB/wQFMAMBAf8wDQYJKoZIhvcNAQELBQADggEBAIPxbkvNEbrKS5lQiFpgRJhoUcEgSgkWFnRNggHDUAlPWFZSDc5SmSUywdangqbjfEwd7SB0oyJ1X5uvyMb8jK8zVpeK2/9OwKz8EzeVo1Kv3H5SB+lM3O45rFiD7ibeA9LtaA/Fm8gOylolukps79vqcFuRKrhZGR6/JprxwufWvfy3YNaR6gM4WWjs+j9asAST6xrSLnUVbOOlamRYPYPARk+9/WdNZgBBFIZ5vGOyKMgb8nMUzcL8Mx4Pv38+RLxE1KQRbXG0e1Za0B/odpBbZVE/tB3teAbXoRcVPz13MaHjrFGjLX9DZs+yDpsBdFlPXBGjN98dbvlcw7P7FNQxggFnMIIBYwIBATA+MCYxJDAiBgNVBAMMG2Fwa2VlcCBvZmZsaW5lIHRlc3QgZml4dHVyZQIUEKNZtH0wyS/cxaxspAMvsSzyOdYwCwYJYIZIAWUDBAIBMA0GCSqGSIb3DQEBAQUABIIBAFOXnnZCTCKTF5RuTWoO8SkkKB7/kLMJ7VF4y/t3OS8LjJFnfxomefl5TyLLHQJ8LyY/gPN5vlLa44woSXYrLktQzYuhgabbLZS25pN9v8Ln88h/+vH42oNQ67OxvAcsWikEf7eL9NxcQ3OW9b6+uVLWuwei0LUGq1+qd3VODVviio2Cy+mLMLDfis3AlE5CwaxbBHVmdcVIJ6kSEM2l3HpESd/08QKV2PU6wYnqKz5BLabbcOL+ZtBJ4vWm9LRX0G2vRv/UetVTmE42FpI6TCOOcO5qfHktBf18A8iCk8DYlszQrMkiIBx5AeSyAt8gRFaoCLNX8Wh+Dzp7c1Lgmjw=";
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_during_cache_304_never_reads_victim_archive() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempdir().unwrap();
+    let original = root.path().join("cache");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&victim).unwrap();
+    fs::write(original.join("entry.jar"), b"original signed archive").unwrap();
+    fs::write(original.join("entry.etag"), b"tag").unwrap();
+    fs::write(victim.join("entry.jar"), b"victim bytes").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let repo = format!("http://{}", listener.local_addr().unwrap());
+    let (ready, wait) = tokio::sync::oneshot::channel();
+    let (release, go) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        ready.send(()).unwrap();
+        go.await.unwrap();
+        socket
+            .write_all(b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+    });
+    let dir = tempdir().unwrap();
+    let cache = original.join("entry");
+    let (result, ()) = tokio::join!(
+        download_repository_archive(&dir, &repo, false, Some(&cache)),
+        async {
+            wait.await.unwrap();
+            fs::rename(&original, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &original).unwrap();
+            release.send(()).unwrap();
+        }
+    );
+    server.await.unwrap();
+    result.unwrap();
+    assert_eq!(
+        fs::read(dir.path().join("jar.zip")).unwrap(),
+        b"original signed archive"
+    );
+    assert_eq!(fs::read(victim.join("entry.jar")).unwrap(), b"victim bytes");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_hash_reader_never_follows_final_symlink() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join("victim"), b"good").unwrap();
+    let path = dir.path().join("link.apk");
+    std::os::unix::fs::symlink(dir.path().join("victim"), &path).unwrap();
+    assert!(
+        file_matches_sha256(&path, Sha256::digest(b"good").as_slice())
+            .await
+            .is_err()
+    );
+}
+
 const APP: &str = "org.example.app";
 const REPO: &str = "https://repository.invalid/repo";
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cache_atomic_write_stays_pinned_and_rejects_final_symlink() {
+    let root = tempdir().unwrap();
+    let original = root.path().join("cache");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&victim).unwrap();
+    let cache = OutputDirectory::open(&original).unwrap();
+    fs::rename(&original, &moved).unwrap();
+    std::os::unix::fs::symlink(&victim, &original).unwrap();
+    write_cache_file_pinned(&cache, "entry.jar", b"one").unwrap();
+    write_cache_file_pinned(&cache, "entry.jar", b"two").unwrap();
+    fs::write(victim.join("secret"), b"untouched").unwrap();
+    std::os::unix::fs::symlink(victim.join("secret"), moved.join("entry.etag")).unwrap();
+    assert!(write_cache_file_pinned(&cache, "entry.etag", b"overwrite").is_err());
+    assert_eq!(fs::read(moved.join("entry.jar")).unwrap(), b"two");
+    assert_eq!(fs::read(victim.join("secret")).unwrap(), b"untouched");
+    assert_eq!(fs::read_dir(&victim).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 2);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_during_fdroid_apk_transfer_keeps_publication_pinned() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempdir().unwrap();
+    let original = root.path().join("out");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    fs::create_dir(&original).unwrap();
+    fs::create_dir(&victim).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let repo = format!("http://{}", listener.local_addr().unwrap());
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 4096];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ng")
+            .await
+            .unwrap();
+        wait.await.unwrap();
+        socket.write_all(b"ood").await.unwrap();
+    });
+    let (result, ()) = tokio::join!(
+        download_from_index(
+            apk_index(&repo, &[(APP, "base.apk")]),
+            vec![(APP.into(), None)],
+            1,
+            0,
+            &original,
+            None,
+            progress()
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while fs::read_dir(&original).unwrap().count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            fs::rename(&original, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &original).unwrap();
+            release.send(()).unwrap();
+        }
+    );
+    server.await.unwrap();
+    assert!(result);
+    assert_eq!(fs::read(moved.join(format!("{APP}.apk"))).unwrap(), b"good");
+    assert_eq!(fs::read_dir(&moved).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+}
 
 // Explicit fixture transport injection. Public entry points never select this
 // client; only the local test harness passes it to narrow internal seams.
@@ -98,6 +237,7 @@ async fn download_from_index(
             repo: &repo,
             client: Some(&fixture_client()),
             progress: mp,
+            verified_index: true,
         },
     )
     .await
@@ -1184,6 +1324,7 @@ async fn public_entry_and_apk_transports_reject_private_destination_before_get()
                 repo: &repo,
                 client: None,
                 progress: progress(),
+                verified_index: true,
             },
         )
         .await
@@ -1254,6 +1395,7 @@ async fn selected_mirror_routes_apk_ignoring_malicious_index_address() {
                 repo: &format!("{mirror}/mirror"),
                 client: Some(&fixture_client()),
                 progress: progress(),
+                verified_index: true,
             },
         ),
     )
@@ -1421,21 +1563,27 @@ async fn reliability_all_download_jobs_run_even_after_checksum_failure() {
 }
 
 #[tokio::test]
-async fn reliability_missing_selection_still_downloads_valid_job_but_returns_false() {
+async fn typed_report_missing_selection_still_downloads_valid_job_but_returns_false() {
     let (repo, server) = fixture_server(vec![http_ok(b"good")]).await;
     let dir = tempdir().unwrap();
-    assert!(
-        !download_from_index(
+    let apps = vec![("missing.app".into(), None), (APP.into(), None)];
+    let (ok, report) = crate::results::collect(
+        crate::results::Report::new("f-droid", "download", apps).unwrap(),
+        download_from_index(
             apk_index(&repo, &[(APP, "app.apk")]),
             vec![("missing.app".into(), None), (APP.into(), None)],
             0,
             0,
             dir.path(),
             None,
-            progress()
-        )
-        .await
-    );
+            progress(),
+        ),
+    )
+    .await;
+    assert!(!ok);
+    let value: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    assert_eq!(value["results"][0]["status"], "not_found");
+    assert_eq!(value["results"][1]["status"], "success");
     tokio::time::timeout(Duration::from_secs(3), server)
         .await
         .unwrap()
@@ -2244,4 +2392,91 @@ fn v1_latest_no_match_returns_no_download_without_panic() {
     ] {
         assert!(parse(index(packages), None, Some("arm64-v8a")).0.is_empty());
     }
+}
+
+#[tokio::test]
+async fn typed_report_unsigned_index_never_proves_absence() {
+    let dir = tempdir().unwrap();
+    let apps = vec![("missing.app".into(), None)];
+    let output = OutputDirectory::open(dir.path()).unwrap();
+    let (ok, report) = crate::results::collect(
+        crate::results::Report::new("f-droid", "download", apps.clone()).unwrap(),
+        super::download_from_index_pinned(
+            apk_index("https://example.com", &[]),
+            apps,
+            1,
+            0,
+            &output,
+            None,
+            RepositoryDownload {
+                repo: "https://example.com",
+                client: None,
+                progress: progress(),
+                verified_index: false,
+            },
+        ),
+    )
+    .await;
+    assert!(!ok);
+    let value: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    assert_eq!(value["results"][0]["status"], "error");
+    assert_eq!(value["results"][0]["reason"], "integrity");
+}
+
+#[tokio::test]
+async fn typed_report_fdroid_variants_corruption_and_verified_existing_are_distinct() {
+    let dir = tempdir().unwrap();
+    fs::write(dir.path().join(format!("{APP}.apk")), b"good").unwrap();
+    let mut index = apk_index(
+        "https://example.com",
+        &[(APP, "good.apk"), ("com.example.corrupt", "bad.apk")],
+    );
+    index["packages"]["com.example.corrupt"][0]["hash"] = json!("malformed");
+    let apps = vec![
+        (APP.into(), None),
+        (APP.into(), Some("wrong".into())),
+        ("com.example.corrupt".into(), None),
+        ("com.example.absent".into(), None),
+    ];
+    let (ok, report) = crate::results::collect(
+        crate::results::Report::new("f-droid", "download", apps.clone()).unwrap(),
+        download_from_index(index, apps, 3, 0, dir.path(), None, progress()),
+    )
+    .await;
+    assert!(!ok);
+    let value: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    for (i, status, reason) in [
+        (0, "success", "complete"),
+        (1, "unavailable", "variant_unavailable"),
+        (2, "error", "integrity"),
+        (3, "not_found", "package_absent"),
+    ] {
+        assert_eq!(value["results"][i]["status"], status);
+        assert_eq!(value["results"][i]["reason"], reason);
+    }
+}
+
+#[tokio::test]
+async fn typed_report_malformed_abi_metadata_is_error_not_variant_unavailable() {
+    let dir = tempdir().unwrap();
+    let mut index = apk_index("https://example.com", &[(APP, "good.apk")]);
+    index["packages"][APP][0]["nativecode"] = json!("malformed");
+    let apps = vec![(APP.into(), None)];
+    let (ok, report) = crate::results::collect(
+        crate::results::Report::new("f-droid", "download", apps.clone()).unwrap(),
+        download_from_index(
+            index,
+            apps,
+            1,
+            0,
+            dir.path(),
+            Some("x86".into()),
+            progress(),
+        ),
+    )
+    .await;
+    assert!(!ok);
+    let value: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    assert_eq!(value["results"][0]["status"], "error");
+    assert_eq!(value["results"][0]["reason"], "integrity");
 }

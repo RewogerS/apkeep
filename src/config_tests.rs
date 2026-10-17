@@ -1,5 +1,17 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn config_creation_rejects_symlink_parent_before_creating_children() {
+    let root = tempfile::tempdir().unwrap();
+    let victim = root.path().join("victim");
+    fs::create_dir(&victim).unwrap();
+    let link = root.path().join("link");
+    std::os::unix::fs::symlink(&victim, &link).unwrap();
+    assert!(create_dir(&link.join("apkeep")).is_err());
+    assert_eq!(fs::read_dir(&victim).unwrap().count(), 0);
+}
+
 #[test]
 fn creates_missing_directory_and_preserves_existing_contents() {
     let temp = tempfile::tempdir().unwrap();

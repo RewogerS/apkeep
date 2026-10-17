@@ -153,6 +153,7 @@ mod config;
 mod consts;
 #[cfg(test)]
 mod input_tests;
+mod results;
 mod util;
 
 mod download_sources;
@@ -321,6 +322,10 @@ async fn main() {
         }
     };
 
+    run(matches).await;
+}
+
+async fn run(matches: clap::ArgMatches) {
     let mut download_source = *matches
         .get_one::<DownloadSource>("download_source")
         .unwrap();
@@ -404,251 +409,303 @@ async fn main() {
         Vec::new()
     };
 
-    let huawei_region = if download_source == DownloadSource::HuaweiAppGallery {
-        match download_sources::huawei_app_gallery::region(
-            matches.get_one::<String>("options").map(String::as_str),
+    // Parser/CSV failures above cannot establish a trustworthy input list and
+    // deliberately produce no report. Pin/check its destination before any work.
+    let report_destination = matches.get_one::<String>("report_json").map(|path| {
+        let path = Path::new(path);
+        let name = path.file_name().and_then(|n| n.to_str()).filter(|n| {
+            n.len() <= 240 && n.ends_with(".json")
+                && !n.chars().any(|c| c.is_control() || c == '\\')
+        });
+        let directory = tokio_dl_stream_to_disk::OutputDirectory::open(
+            path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")),
+        );
+        match (name, directory) {
+            (Some(name), Ok(directory)) if matches!(fs::symlink_metadata(directory.path().join(name)), Err(e) if e.kind() == io::ErrorKind::NotFound) => (directory, name.to_owned()),
+            _ => { eprintln!("Invalid, unsafe or existing result report destination (expected .json)"); std::process::exit(1); }
+        }
+    });
+    let report = if report_destination.is_some() {
+        match results::Report::new(
+            &download_source.to_string(),
+            if matches.get_flag("list_versions") {
+                "list"
+            } else {
+                "download"
+            },
+            list.clone(),
         ) {
-            Ok(region) => Some(region),
-            Err(error) => {
-                eprintln!("Huawei AppGallery: {error}");
+            Ok(report) => Some(report),
+            Err(message) => {
+                eprintln!("{message}");
                 std::process::exit(1);
             }
         }
     } else {
         None
     };
+    // Identical requests share one provider operation but retain all report rows.
+    let mut seen = std::collections::HashSet::new();
+    let list = list
+        .into_iter()
+        .filter(|item| seen.insert(item.clone()))
+        .collect();
+    let operation = async {
+        let huawei_region = if download_source == DownloadSource::HuaweiAppGallery {
+            match download_sources::huawei_app_gallery::region(
+                matches.get_one::<String>("options").map(String::as_str),
+            ) {
+                Ok(region) => Some(region),
+                Err(error) => {
+                    results::pending_error(results::Reason::InvalidInput);
+                    eprintln!("Huawei AppGallery: {error}");
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
 
-    if let Some(true) = matches.get_one::<bool>("list_versions") {
-        match download_source {
-            DownloadSource::APKPure => {
-                if !apkpure::list_versions(list, options).await {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::GooglePlay => {
-                if !google_play::list_versions(list) {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::FDroid => {
-                if !fdroid::list_versions(list, options).await {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::HuaweiAppGallery => {
-                if !download_sources::huawei_app_gallery::list_versions(list) {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::RuStore => {
-                if !rustore::list_versions(list).await {
-                    std::process::exit(1);
-                }
-            }
-        }
-    } else {
-        let parallel = matches.get_one::<usize>("parallel").map(|v| *v).unwrap();
-        if parallel == 0 {
-            if download_source == DownloadSource::HuaweiAppGallery {
-                eprintln!("Huawei AppGallery: nonempty app list and parallel >= 1 required");
-            } else {
-                eprintln!("parallel must be greater than zero");
-            }
-            std::process::exit(1);
-        }
-        let sleep_duration = matches
-            .get_one::<u64>("sleep_duration")
-            .map(|v| *v)
-            .unwrap();
-        let outpath = matches.get_one::<String>("OUTPATH").map_or_else(
-            || {
-                if oauth_token.is_none() {
-                    input_error("OUTPATH must be specified when downloading files");
-                    std::process::exit(1);
-                }
-                None
-            },
-            |outpath| match fs::canonicalize(outpath) {
-                Ok(outpath) if Path::new(&outpath).is_dir() => Some(outpath),
-                _ => {
-                    if download_source == DownloadSource::HuaweiAppGallery {
-                        eprintln!("Huawei AppGallery: OUTPATH is not a valid directory");
-                    } else if download_source == DownloadSource::RuStore {
-                        eprintln!("RuStore: OUTPATH is not a valid directory");
-                    } else {
-                        input_error("OUTPATH is not a valid directory");
+        if let Some(true) = matches.get_one::<bool>("list_versions") {
+            match download_source {
+                DownloadSource::APKPure => {
+                    if !apkpure::list_versions(list, options).await {
+                        return false;
                     }
-                    std::process::exit(1);
                 }
-            },
-        );
-
-        match download_source {
-            DownloadSource::HuaweiAppGallery => {
-                if !download_sources::huawei_app_gallery::download_apps(
-                    list,
-                    parallel,
-                    sleep_duration,
-                    &outpath.unwrap(),
-                    huawei_region.as_deref().unwrap(),
-                )
-                .await
-                {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::APKPure => {
-                if !apkpure::download_apps(
-                    list,
-                    parallel,
-                    sleep_duration,
-                    &outpath.unwrap(),
-                    options,
-                )
-                .await
-                {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::GooglePlay => {
-                let mut email = matches
-                    .get_one::<String>("google_email")
-                    .map(|v| v.to_string());
-
-                if email.is_some() && oauth_token.is_some() {
-                    if !google_play::request_aas_token(
-                        &email.unwrap(),
-                        &oauth_token.unwrap(),
-                        options,
-                    )
-                    .await
-                    {
-                        std::process::exit(1);
+                DownloadSource::GooglePlay => {
+                    if !google_play::list_versions(list) {
+                        return false;
                     }
+                }
+                DownloadSource::FDroid => {
+                    if !fdroid::list_versions(list, options).await {
+                        return false;
+                    }
+                }
+                DownloadSource::HuaweiAppGallery => {
+                    if !download_sources::huawei_app_gallery::list_versions(list) {
+                        return false;
+                    }
+                }
+                DownloadSource::RuStore => {
+                    if !rustore::list_versions(list).await {
+                        return false;
+                    }
+                }
+            }
+        } else {
+            let parallel = matches.get_one::<usize>("parallel").copied().unwrap();
+            if parallel == 0 {
+                results::pending_error(results::Reason::InvalidInput);
+                if download_source == DownloadSource::HuaweiAppGallery {
+                    eprintln!("Huawei AppGallery: nonempty app list and parallel >= 1 required");
                 } else {
-                    let mut aas_token = matches
-                        .get_one::<String>("google_aas_token")
-                        .map(|v| v.to_string());
-                    let mut auth_token = matches
-                        .get_one::<String>("google_auth_token")
-                        .map(|v| v.to_string());
-                    let accept_tos = match matches.get_one::<bool>("google_accept_tos") {
-                        Some(true) => true,
-                        _ => false,
-                    };
+                    eprintln!("parallel must be greater than zero");
+                }
+                return false;
+            }
+            let sleep_duration = matches.get_one::<u64>("sleep_duration").copied().unwrap();
+            let outpath = if let Some(outpath) = matches.get_one::<String>("OUTPATH") {
+                match tokio_dl_stream_to_disk::OutputDirectory::open(Path::new(outpath)) {
+                    Ok(_) => Some(PathBuf::from(outpath)),
+                    Err(_) => {
+                        results::pending_error(results::Reason::LocalIo);
+                        input_error("OUTPATH is not a valid directory");
+                        return false;
+                    }
+                }
+            } else if oauth_token.is_none() {
+                input_error("OUTPATH must be specified when downloading files");
+                return false;
+            } else {
+                None
+            };
 
-                    let conf =
-                        match load_config(matches.get_one::<String>("ini").map(PathBuf::from)) {
-                            Ok(conf) => conf,
-                            Err(_) => {
-                                eprintln!("Could not load Google Play configuration");
-                                std::process::exit(1);
-                            }
-                        };
-                    if email.is_none() {
-                        email = conf.get("google", "email");
-                    }
-                    if aas_token.is_none() && auth_token.is_none() {
-                        aas_token = conf.get("google", "aas_token");
-                        if aas_token.is_none() {
-                            auth_token = conf.get("google", "auth_token");
-                        }
-                    }
-                    if email.is_none() || (aas_token.is_none() && auth_token.is_none()) {
-                        if !io::stdin().is_terminal() {
-                            eprintln!("Missing Google Play credentials: interactive input requires a terminal");
-                            std::process::exit(1);
-                        }
-                    }
-                    if email.is_none() {
-                        let mut prompt_email = String::new();
-                        eprint!("Email: ");
-                        if io::stderr().flush().is_err()
-                            || io::stdin().read_line(&mut prompt_email).is_err()
-                        {
-                            eprintln!("Could not read Google Play email");
-                            std::process::exit(1);
-                        }
-                        email = Some(prompt_email.trim().to_string());
-                    }
-                    if aas_token.is_none() && auth_token.is_none() {
-                        let token = match rpassword::prompt_password("AAS Token (or AUTH Token): ")
-                        {
-                            Ok(token)
-                                if !token.is_empty() && !token.chars().any(char::is_whitespace) =>
-                            {
-                                token
-                            }
-                            _ => {
-                                eprintln!(
-                                    "Could not securely read Google Play token from terminal"
-                                );
-                                std::process::exit(1);
-                            }
-                        };
-                        if token.starts_with("ya29.") {
-                            auth_token = Some(token);
-                        } else {
-                            aas_token = Some(token);
-                        }
-                    }
-                    if email
-                        .as_deref()
-                        .is_none_or(|v| v.is_empty() || v.chars().any(char::is_whitespace))
-                        || aas_token
-                            .as_deref()
-                            .is_some_and(|v| v.is_empty() || v.chars().any(char::is_whitespace))
-                        || auth_token
-                            .as_deref()
-                            .is_some_and(|v| v.is_empty() || v.chars().any(char::is_whitespace))
-                    {
-                        eprintln!("Invalid Google Play credentials");
-                        std::process::exit(1);
-                    }
-
-                    if !google_play::download_apps(
+            match download_source {
+                DownloadSource::HuaweiAppGallery => {
+                    if !download_sources::huawei_app_gallery::download_apps(
                         list,
                         parallel,
                         sleep_duration,
-                        &email.unwrap(),
-                        aas_token.as_deref(),
-                        auth_token.as_deref(),
                         &outpath.unwrap(),
-                        accept_tos,
+                        huawei_region.as_deref().unwrap(),
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
+                DownloadSource::APKPure => {
+                    if !apkpure::download_apps(
+                        list,
+                        parallel,
+                        sleep_duration,
+                        &outpath.unwrap(),
                         options,
                     )
                     .await
                     {
-                        std::process::exit(1);
+                        return false;
+                    }
+                }
+                DownloadSource::GooglePlay => {
+                    let mut email = matches
+                        .get_one::<String>("google_email")
+                        .map(|v| v.to_string());
+
+                    if let (Some(email), Some(oauth_token)) = (&email, &oauth_token) {
+                        if !google_play::request_aas_token(email, oauth_token, options).await {
+                            return false;
+                        }
+                    } else {
+                        let mut aas_token = matches
+                            .get_one::<String>("google_aas_token")
+                            .map(|v| v.to_string());
+                        let mut auth_token = matches
+                            .get_one::<String>("google_auth_token")
+                            .map(|v| v.to_string());
+                        let accept_tos = matches.get_flag("google_accept_tos");
+
+                        let conf = match load_config(
+                            matches.get_one::<String>("ini").map(PathBuf::from),
+                        ) {
+                            Ok(conf) => conf,
+                            Err(_) => {
+                                results::pending_error(results::Reason::InvalidInput);
+                                eprintln!("Could not load Google Play configuration");
+                                return false;
+                            }
+                        };
+                        if email.is_none() {
+                            email = conf.get("google", "email");
+                        }
+                        if aas_token.is_none() && auth_token.is_none() {
+                            aas_token = conf.get("google", "aas_token");
+                            if aas_token.is_none() {
+                                auth_token = conf.get("google", "auth_token");
+                            }
+                        }
+                        if (email.is_none() || (aas_token.is_none() && auth_token.is_none()))
+                            && !io::stdin().is_terminal()
+                        {
+                            results::pending_error(results::Reason::Authentication);
+                            eprintln!("Missing Google Play credentials: interactive input requires a terminal");
+                            return false;
+                        }
+                        if email.is_none() {
+                            let mut prompt_email = String::new();
+                            eprint!("Email: ");
+                            if io::stderr().flush().is_err()
+                                || io::stdin().read_line(&mut prompt_email).is_err()
+                            {
+                                results::pending_error(results::Reason::Authentication);
+                                eprintln!("Could not read Google Play email");
+                                return false;
+                            }
+                            email = Some(prompt_email.trim().to_string());
+                        }
+                        if aas_token.is_none() && auth_token.is_none() {
+                            let token =
+                                match rpassword::prompt_password("AAS Token (or AUTH Token): ") {
+                                    Ok(token)
+                                        if !token.is_empty()
+                                            && !token.chars().any(char::is_whitespace) =>
+                                    {
+                                        token
+                                    }
+                                    _ => {
+                                        results::pending_error(results::Reason::Authentication);
+                                        eprintln!(
+                                    "Could not securely read Google Play token from terminal"
+                                );
+                                        return false;
+                                    }
+                                };
+                            if token.starts_with("ya29.") {
+                                auth_token = Some(token);
+                            } else {
+                                aas_token = Some(token);
+                            }
+                        }
+                        if email
+                            .as_deref()
+                            .is_none_or(|v| v.is_empty() || v.chars().any(char::is_whitespace))
+                            || aas_token
+                                .as_deref()
+                                .is_some_and(|v| v.is_empty() || v.chars().any(char::is_whitespace))
+                            || auth_token
+                                .as_deref()
+                                .is_some_and(|v| v.is_empty() || v.chars().any(char::is_whitespace))
+                        {
+                            results::pending_error(results::Reason::Authentication);
+                            eprintln!("Invalid Google Play credentials");
+                            return false;
+                        }
+
+                        if !google_play::download_apps(
+                            list,
+                            parallel,
+                            sleep_duration,
+                            &email.unwrap(),
+                            aas_token.as_deref(),
+                            auth_token.as_deref(),
+                            &outpath.unwrap(),
+                            accept_tos,
+                            options,
+                        )
+                        .await
+                        {
+                            return false;
+                        }
+                    }
+                }
+                DownloadSource::FDroid => {
+                    if !fdroid::download_apps(
+                        list,
+                        parallel,
+                        sleep_duration,
+                        &outpath.unwrap(),
+                        options,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                }
+                DownloadSource::RuStore => {
+                    if !rustore::download_apps(
+                        list,
+                        parallel,
+                        sleep_duration,
+                        &outpath.unwrap(),
+                        options,
+                    )
+                    .await
+                    {
+                        return false;
                     }
                 }
             }
-            DownloadSource::FDroid => {
-                if !fdroid::download_apps(
-                    list,
-                    parallel,
-                    sleep_duration,
-                    &outpath.unwrap(),
-                    options,
-                )
-                .await
-                {
-                    std::process::exit(1);
-                }
-            }
-            DownloadSource::RuStore => {
-                if !rustore::download_apps(
-                    list,
-                    parallel,
-                    sleep_duration,
-                    &outpath.unwrap(),
-                    options,
-                )
-                .await
-                {
-                    std::process::exit(1);
-                }
+        }
+        true
+    };
+    let success = if let Some(mut report) = report {
+        let (success, collected) = results::collect(report, operation).await;
+        report = collected;
+        report.finish(success);
+        let mut success = success && report.succeeded();
+        if let Some((directory, name)) = report_destination {
+            if report.write_to(&directory, &name).is_err() {
+                eprintln!("Could not publish result report");
+                success = false;
             }
         }
+        success
+    } else {
+        operation.await
+    };
+    if !success {
+        std::process::exit(1);
     }
 }

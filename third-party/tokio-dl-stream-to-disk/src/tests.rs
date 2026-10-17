@@ -2,6 +2,77 @@ use super::*;
 use std::time::Duration;
 use tokio::net::TcpListener;
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn injected_output_guard_is_owned_without_accepting_user_procfs_paths() {
+    let fixture = tempfile::tempdir().unwrap();
+    let output = OutputDirectory::open(fixture.path()).unwrap();
+    let path = output.path().to_owned();
+    let mut dl = AsyncDownload::new_in("unused", &output, "artifact.bin").unwrap();
+    drop(output);
+    dl.response_stream = Some(Box::new(futures_util::stream::iter(vec![Ok(
+        Bytes::from_static(b"pinned"),
+    )])));
+    dl.download(&None).await.unwrap();
+    assert_eq!(
+        std::fs::read(fixture.path().join("artifact.bin")).unwrap(),
+        b"pinned"
+    );
+    let output = OutputDirectory::open(fixture.path()).unwrap();
+    let mut untrusted = AsyncDownload::new("unused", output.path(), "other.bin");
+    untrusted.response_stream = Some(Box::new(futures_util::stream::iter(vec![Ok(
+        Bytes::from_static(b"bad"),
+    )])));
+    assert!(untrusted.download(&None).await.is_err());
+    assert!(OutputDirectory::open(&path).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_during_transfer_pins_publication_and_cleanup() {
+    for fail in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("out");
+        let moved = root.path().join("moved");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        std::fs::write(victim.join("marker"), b"untouched").unwrap();
+        let mut dl = AsyncDownload::new("unused", &original, "artifact.bin");
+        dl.response_stream = Some(Box::new(futures_util::stream::iter(vec![
+            Ok(Bytes::from_static(b"bytes")),
+            if fail {
+                Err(IOError::other("fixture failure"))
+            } else {
+                Ok(Bytes::new())
+            },
+        ])));
+        let swapped = std::cell::Cell::new(false);
+        let callback: Option<Box<dyn Fn(u64)>> = Some(Box::new(move |_| {
+            if !swapped.replace(true) {
+                std::fs::rename(&original, &moved).unwrap();
+                std::os::unix::fs::symlink(&victim, &original).unwrap();
+            }
+        }));
+        assert_eq!(dl.download(&callback).await.is_ok(), !fail);
+        assert_eq!(
+            std::fs::read_dir(root.path().join("victim"))
+                .unwrap()
+                .count(),
+            1
+        );
+        let names: Vec<_> = std::fs::read_dir(root.path().join("moved"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        if fail {
+            assert!(names.is_empty(), "staging leaked after failure: {names:?}");
+        } else {
+            assert_eq!(names, [std::ffi::OsString::from("artifact.bin")]);
+        }
+    }
+}
+
 #[tokio::test]
 async fn production_download_rejects_loopback_before_connecting() {
     let out = tempfile::tempdir().unwrap();

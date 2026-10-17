@@ -17,6 +17,12 @@ or a blanket security certification. Detailed contracts are in [RELIABILITY.md](
   metadata paths have bounded reads. Timeouts are failures, not store absence.
 - Path components and metadata-derived names are checked. APKPure version
   matching no longer borrows the URL of a following version record.
+- Linux source output operations now retain directory descriptors across
+  transfers, publication and cleanup; Google nested artifacts and F-Droid signed
+  cache reads/writes use pinned parents. Original OUTPATH is not canonicalized
+  before no-follow traversal. Unsupported platforms/procfs fail closed. This
+  prevents ancestor redirection, not malicious-owner/root/same-UID interference,
+  post-publication unlink or an untrusted process temporary directory.
 - F-Droid repository/index/cache failures are propagated instead of panicking or
   reporting a successful empty operation. Signed archives are reverified on cache
   use rather than trusting an unsigned JSON cache across verification settings.
@@ -47,8 +53,9 @@ report existing unverified outputs as successful skips.
 Shared public-network policy covers production RuStore/Huawei/APKPure metadata
 and artifacts as well as F-Droid, with explicit injected clients for loopback
 fixtures. gpapi's own internal HTTP remains outside that policy. These changes
-do not close Huawei ZIP/manifest/publisher validation, add typed per-item
-not-found exit codes, or provide dirfd isolation against a hostile local owner.
+include bounded Huawei ZIP/CRC/native-manifest validation and opt-in schema-1
+per-input JSON reports (see RESULTS.md). They do not certify publisher identity,
+change the legacy 0/1/2 exit taxonomy, or isolate a hostile local directory owner.
 See RELIABILITY.md and source-specific usage for compatibility changes/limits.
 
 ## Not certified or not activated

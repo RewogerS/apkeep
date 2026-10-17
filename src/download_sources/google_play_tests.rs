@@ -1,6 +1,133 @@
 // All backend outcomes and credentials here are synthetic; no Google requests.
 use super::*;
 
+#[tokio::test]
+async fn real_google_artifact_adapter_uses_injected_pinned_guard_for_nested_downloads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let out = tempfile::tempdir().unwrap();
+    let output = OutputDirectory::open(out.path()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 4096];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ngood")
+                .await
+                .unwrap();
+        }
+    });
+    let info = (
+        Some(url.clone()),
+        vec![(Some("config.x86".into()), Some(url))],
+        vec![],
+        None,
+    );
+    transfer_play_artifacts(
+        "com.fixture.app",
+        info,
+        &output,
+        DownloadSettings {
+            split_apk: true,
+            ..Default::default()
+        },
+        Rc::new(MultiProgress::new()),
+        Some(reqwest::Client::builder().no_proxy().build().unwrap()),
+    )
+    .await
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(
+        std::fs::read(out.path().join("com.fixture.app/com.fixture.app.apk")).unwrap(),
+        b"good"
+    );
+    assert_eq!(
+        std::fs::read(
+            out.path()
+                .join("com.fixture.app/com.fixture.app.config.x86.apk")
+        )
+        .unwrap(),
+        b"good"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_keeps_google_split_publication_and_cleanup_pinned() {
+    struct SwappingBackend {
+        original: std::path::PathBuf,
+        moved: std::path::PathBuf,
+        victim: std::path::PathBuf,
+        fail: bool,
+    }
+    impl PlayBackend for SwappingBackend {
+        async fn login(&mut self) -> Result<(), GpError> {
+            Ok(())
+        }
+        async fn accept_tos(&mut self) -> Result<(), GpError> {
+            Ok(())
+        }
+        async fn request_token(&mut self, _: &str) -> Result<Option<String>, GpError> {
+            Ok(None)
+        }
+        async fn download(
+            &self,
+            app: &str,
+            out: &OutputDirectory,
+            _: DownloadSettings,
+            _: Rc<MultiProgress>,
+        ) -> Result<(), GpError> {
+            let out = out.path();
+            split_fixture(out, app);
+            std::fs::rename(&self.original, &self.moved).unwrap();
+            std::os::unix::fs::symlink(&self.victim, &self.original).unwrap();
+            if self.fail {
+                Err(GpError::new(ErrorKind::InvalidApp))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    for fail in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("out");
+        let moved = root.path().join("moved");
+        let victim = root.path().join("victim");
+        std::fs::create_dir(&original).unwrap();
+        std::fs::create_dir(&victim).unwrap();
+        let mut backend = SwappingBackend {
+            original: original.clone(),
+            moved: moved.clone(),
+            victim: victim.clone(),
+            fail,
+        };
+        assert_eq!(
+            download_with_backend(
+                &mut backend,
+                vec![("com.fixture.app".into(), None)],
+                1,
+                0,
+                &original,
+                false,
+                DownloadSettings::default(),
+                Limits::default()
+            )
+            .await,
+            !fail
+        );
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read_dir(&moved).unwrap().count(),
+            usize::from(!fail)
+        );
+        if !fail {
+            assert!(moved.join("com.fixture.app/com.fixture.app.apk").is_file());
+        }
+    }
+}
+
 #[test]
 fn constructor_panic_hook_forwards_unrelated_panics_on_same_and_other_threads() {
     if std::env::var_os("APKEEP_GPAPI_HOOK_FIXTURE").is_some() {
@@ -126,12 +253,17 @@ impl PlayBackend for OfflineBackend {
     async fn download(
         &self,
         app: &str,
-        out: &Path,
+        out: &OutputDirectory,
         _: DownloadSettings,
         _: Rc<MultiProgress>,
     ) -> Result<(), GpError> {
+        let out = out.path();
         self.calls.borrow_mut().push(app.into());
-        self.stages.borrow_mut().push(out.to_owned());
+        // Descriptor numbers can be reused after a retry. Observe the actual
+        // unique staging entry for cleanup assertions, not the ephemeral fd name.
+        self.stages
+            .borrow_mut()
+            .push(std::fs::read_link(out).unwrap());
         assert_eq!(
             std::fs::read_dir(out).unwrap().count(),
             0,
@@ -284,24 +416,36 @@ async fn every_download_retry_is_bounded_and_partial_files_are_cleaned() {
 }
 
 #[tokio::test]
-async fn mixed_backend_outcomes_fail_the_batch_but_drain_every_app() {
+async fn typed_report_mixed_backend_outcomes_fail_the_batch_but_drain_every_app() {
     let out = tempfile::tempdir().unwrap();
     let mut backend = OfflineBackend::default();
     *backend.actions.borrow_mut() = VecDeque::from([Action::Error, Action::Single]);
-    let result = download_with_backend(
-        &mut backend,
-        vec![
-            ("com.fixture.bad".into(), None),
-            ("com.fixture.good".into(), None),
-        ],
-        1,
-        0,
-        out.path(),
-        false,
-        DownloadSettings::default(),
-        Limits::default(),
+    let apps = vec![
+        ("com.fixture.bad".into(), None),
+        ("com.fixture.good".into(), None),
+    ];
+    let (result, report) = crate::results::collect(
+        crate::results::Report::new("google-play", "download", apps).unwrap(),
+        download_with_backend(
+            &mut backend,
+            vec![
+                ("com.fixture.bad".into(), None),
+                ("com.fixture.good".into(), None),
+            ],
+            1,
+            0,
+            out.path(),
+            false,
+            DownloadSettings::default(),
+            Limits::default(),
+        ),
     )
     .await;
+    let value: serde_json::Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    // The fixture's Action::Error is gpapi InvalidApp (not authoritative absence).
+    assert_eq!(value["results"][0]["status"], "unavailable");
+    assert_eq!(value["results"][0]["reason"], "profile_unavailable");
+    assert_eq!(value["results"][1]["status"], "success");
     assert!(!result);
     assert_eq!(
         *backend.calls.borrow(),

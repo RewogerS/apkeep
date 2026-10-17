@@ -1,6 +1,184 @@
 use super::*;
 
 #[tokio::test]
+async fn typed_artifact_failures_preserve_transport_integrity_auth_and_timeout() {
+    use crate::results::{collect, observe, Report};
+    for (status, body, expected) in [
+        ("500 Server Error", "bad", "transport"),
+        ("200 OK", "", "integrity"),
+        ("401 Unauthorized", "bad", "authentication"),
+        ("403 Forbidden", "bad", "authentication"),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/apk", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let out = tempfile::tempdir().unwrap();
+        let (ok, mut report) = collect(
+            Report::new(
+                "ru-store",
+                "download",
+                vec![("com.example.app".into(), None)],
+            )
+            .unwrap(),
+            observe(
+                "com.example.app",
+                None,
+                injected_download_apk(
+                    url,
+                    "com.example.app".into(),
+                    out.path(),
+                    Rc::new(MultiProgress::new()),
+                ),
+            ),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        assert!(!ok);
+        report.finish(ok);
+        let j: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+        assert_eq!(j["results"][0]["reason"], expected, "{status}: {j}");
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+}
+
+#[tokio::test]
+async fn typed_report_mixed_loopback_preserves_duplicates_and_authoritative_absence() {
+    use crate::results::{collect, Report};
+    let out = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let artifact = format!("{base}/apk");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = calls.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let req = read_request(&mut socket).await;
+            let (status, body) = if req.contains("packageNames=com.example.ok") {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ("200 OK", "[{\"id\":42}]".to_owned())
+            } else if req.contains("packageNames=com.example.absent") {
+                ("200 OK", "[]".to_owned())
+            } else if req.contains("packageNames=com.example.bad") {
+                ("200 OK", "not-json PRIVATE_TOKEN".to_owned())
+            } else if req.starts_with("POST ") {
+                (
+                    "200 OK",
+                    json!({"code":"OK", "body":{"downloadUrls":[{"url":artifact}]}}).to_string(),
+                )
+            } else {
+                ("200 OK", "synthetic-apk".to_owned())
+            };
+            socket.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+        }
+    });
+    let apps = vec![
+        ("com.example.ok".into(), None),
+        ("com.example.absent".into(), None),
+        ("com.example.bad".into(), None),
+        ("com.example.ok".into(), None),
+        ("com.example.pinned".into(), Some("2".into())),
+    ];
+    let client = local_client();
+    let (ok, mut report) = collect(
+        Report::new("ru-store", "download", apps.clone()).unwrap(),
+        download_apps_at(
+            apps,
+            4,
+            0,
+            out.path(),
+            HashMap::from([("rustore_version", "11500")]),
+            (&format!("{base}/lookup"), &format!("{base}/link")),
+            Some((&client, &client)),
+        ),
+    )
+    .await;
+    server.abort();
+    let _ = server.await;
+    assert!(!ok);
+    report.finish(ok);
+    let bytes = report.json_bytes().unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE_TOKEN"));
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let rows = value["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 5);
+    for (i, status, reason) in [
+        (0, "success", "complete"),
+        (1, "not_found", "package_absent"),
+        (2, "error", "integrity"),
+        (3, "success", "complete"),
+        (4, "unavailable", "variant_unavailable"),
+    ] {
+        assert_eq!(rows[i]["status"], status, "row {i}: {value}");
+        assert_eq!(rows[i]["reason"], reason);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        std::fs::read(out.path().join("com.example.ok.apk")).unwrap(),
+        b"synthetic-apk"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_during_rustore_transfer_keeps_artifact_and_cleanup_pinned() {
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("out");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/artifact", listener.local_addr().unwrap());
+    let (release, wait) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_request(&mut socket).await;
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\na")
+            .await
+            .unwrap();
+        wait.await.unwrap();
+        socket.write_all(b"bc").await.unwrap();
+    });
+    let (result, ()) = tokio::join!(
+        injected_download_apk(
+            url,
+            "com.example.app".into(),
+            &original,
+            Rc::new(MultiProgress::new())
+        ),
+        async {
+            tokio::time::timeout(TokioDuration::from_secs(2), async {
+                while std::fs::read_dir(&original).unwrap().count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::rename(&original, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &original).unwrap();
+            release.send(()).unwrap();
+        }
+    );
+    server.await.unwrap();
+    assert!(result);
+    assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(moved.join("com.example.app.apk")).unwrap(),
+        b"abc"
+    );
+}
+
+#[tokio::test]
 async fn non_success_artifact_responses_never_publish_body() {
     for headers in ["", "Location: file:///not-read\r\n"] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1530,4 +1708,183 @@ fn sends_required_rustore_version_header() {
             .and_then(|v| v.to_str().ok()),
         Some("11500")
     );
+}
+
+// This is a child-process CLI-driver test. The transport injection is compiled
+// only into this unit-test executable, never into the shipped CLI binary.
+#[tokio::test]
+async fn typed_report_cli_fixture_child() {
+    let Some(root) = std::env::var_os("APKEEP_REPORT_CLI_CHILD") else {
+        return;
+    };
+    let root = std::path::PathBuf::from(root);
+    if let Some(mode) = std::env::var_os("APKEEP_REPORT_CLI_MODE") {
+        let mode = mode.to_str().unwrap();
+        let original = root.join("out");
+        std::fs::create_dir(&original).unwrap();
+        let report = original.join("report.json");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let artifact = format!("{base}/apk");
+        let directory = original.clone();
+        let moved = root.join("moved");
+        let swap = mode == "swap";
+        let race = mode == "race";
+        tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
+                if i == 0 {
+                    if swap {
+                        std::fs::rename(&directory, &moved).unwrap();
+                        std::fs::create_dir(&directory).unwrap();
+                    }
+                    if race {
+                        std::fs::write(directory.join("report.json"), b"concurrent-winner")
+                            .unwrap();
+                    }
+                }
+                let body = match i {
+                    0 => "[{\"id\":42}]".to_owned(),
+                    1 => {
+                        json!({"code":"OK","body":{"downloadUrls":[{"url":artifact}]}}).to_string()
+                    }
+                    _ => "synthetic-apk".to_owned(),
+                };
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let matches = crate::cli::app()
+            .try_get_matches_from([
+                "apkeep",
+                "-d",
+                "ru-store",
+                "-a",
+                "com.example.ok",
+                "--report-json",
+                report.to_str().unwrap(),
+                original.to_str().unwrap(),
+            ])
+            .unwrap();
+        CLI_FIXTURE
+            .scope(
+                (
+                    format!("{base}/lookup"),
+                    format!("{base}/link"),
+                    local_client(),
+                ),
+                crate::run(matches),
+            )
+            .await;
+        return;
+    }
+    let (lookup, lookup_task) = serve_once("200 OK", "[]").await;
+    let csv = root.join("apps.csv");
+    let report = root.join("report.json");
+    std::fs::write(
+        &csv,
+        "com.example.absent,\ncom.example.pinned,2\nPRIVATE/INPUT,3\ncom.example.absent,\n",
+    )
+    .unwrap();
+    let matches = crate::cli::app()
+        .try_get_matches_from([
+            "apkeep",
+            "-d",
+            "ru-store",
+            "-c",
+            csv.to_str().unwrap(),
+            "-v",
+            "2",
+            "--report-json",
+            report.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .unwrap();
+    CLI_FIXTURE
+        .scope(
+            (lookup.clone(), lookup, local_client()),
+            crate::run(matches),
+        )
+        .await;
+    lookup_task.await.unwrap();
+}
+
+#[test]
+fn typed_report_child_cli_mixed_loopback_writes_every_ordered_row() {
+    let root = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "download_sources::rustore::tests::typed_report_cli_fixture_child",
+            "--nocapture",
+        ])
+        .env("APKEEP_REPORT_CLI_CHILD", root.path())
+        .env("APKEEP_RUSTORE_VER", "11500")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bytes = std::fs::read(root.path().join("report.json")).unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    let rows = value["results"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0]["status"], "not_found");
+    assert_eq!(rows[1]["reason"], "variant_unavailable");
+    assert_eq!(rows[2]["reason"], "invalid_input");
+    assert_eq!(rows[3]["status"], "not_found");
+    assert!(!String::from_utf8_lossy(&bytes).contains("PRIVATE"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("PRIVATE"));
+}
+
+#[test]
+fn typed_report_child_cli_pins_parent_and_fails_publication_race_after_download_success() {
+    for mode in ["success", "swap", "race"] {
+        let root = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "download_sources::rustore::tests::typed_report_cli_fixture_child",
+                "--nocapture",
+            ])
+            .env("APKEEP_REPORT_CLI_CHILD", root.path())
+            .env("APKEEP_REPORT_CLI_MODE", mode)
+            .env("APKEEP_RUSTORE_VER", "11500")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if mode == "race" { 1 } else { 0 }),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let out = root
+            .path()
+            .join(if mode == "swap" { "moved" } else { "out" });
+        assert_eq!(
+            std::fs::read(out.join("com.example.ok.apk")).unwrap(),
+            b"synthetic-apk"
+        );
+        let bytes = std::fs::read(out.join("report.json")).unwrap();
+        if mode == "race" {
+            assert_eq!(bytes, b"concurrent-winner");
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("Could not publish result report")
+            );
+        } else {
+            let value: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["success"], true);
+            assert_eq!(value["results"][0]["status"], "success");
+        }
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+        if mode == "swap" {
+            assert_eq!(
+                std::fs::read_dir(root.path().join("out")).unwrap().count(),
+                0
+            );
+        }
+    }
 }

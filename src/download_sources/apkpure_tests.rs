@@ -1,5 +1,40 @@
 use super::*;
 
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "current_thread")]
+async fn ancestor_swap_during_apkpure_metadata_keeps_artifact_in_original_directory() {
+    let server = Server::new(200, |base| format!("(APKJ..{base}/artifact\")"), 200);
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("out");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    let endpoint = |_: &str| {
+        std::fs::rename(&original, &moved).unwrap();
+        std::os::unix::fs::symlink(&victim, &original).unwrap();
+        Ok(Url::parse(&format!("{}/metadata", server.base)).unwrap())
+    };
+    assert!(
+        injected_download_apps_using(
+            vec![("com.example.fixture".into(), None)],
+            1,
+            0,
+            &original,
+            acknowledged(),
+            &fixture_client(),
+            &endpoint
+        )
+        .await
+    );
+    assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    assert_eq!(
+        std::fs::read(moved.join("com.example.fixture.apk")).unwrap(),
+        b"offline synthetic artifact\0\xff"
+    );
+    assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn default_artifact_path_rejects_private_and_credential_urls_without_fetching() {
     for malicious in [
@@ -704,7 +739,7 @@ async fn zero_parallelism_and_missing_acknowledgement_are_false_without_network(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn download_batch_runs_every_item_and_aggregates_failures() {
+async fn typed_report_download_batch_runs_every_item_and_aggregates_failures() {
     for parallel in [1, 3] {
         let good = Server::new(200, |base| format!("APKJ..{base}/artifact"), 200);
         let bad = Server::new(503, |_| "unavailable".to_owned(), 200);
@@ -725,18 +760,27 @@ async fn download_batch_runs_every_item_and_aggregates_failures() {
             ("com.example.after".to_owned(), None),
         ];
         let out = tempfile::tempdir().unwrap();
-        assert!(
-            !injected_download_apps_using(
+        let report = crate::results::Report::new("apk-pure", "download", apps.clone()).unwrap();
+        let (ok, report) = crate::results::collect(
+            report,
+            injected_download_apps_using(
                 apps,
                 parallel,
                 0,
                 out.path(),
                 acknowledged(),
                 &fixture_client(),
-                &endpoint
-            )
-            .await
-        );
+                &endpoint,
+            ),
+        )
+        .await;
+        assert!(!ok);
+        let value: serde_json::Value =
+            serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+        assert_eq!(value["results"][0]["reason"], "transport");
+        assert_eq!(value["results"][1]["reason"], "invalid_input");
+        assert_eq!(value["results"][2]["status"], "success");
+        assert_eq!(value["results"][3]["status"], "success");
         for app in ["com.example.success", "com.example.after"] {
             assert_eq!(
                 std::fs::read(out.path().join(format!("{app}.apk"))).unwrap(),

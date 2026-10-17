@@ -3,7 +3,8 @@
 Original: `tokio-dl-stream-to-disk` **1.0.2**, EFForg, crates.io distribution.
 Author: **William Budington <bill@eff.org>**. Original MIT license and EFF
 copyright are retained verbatim in LICENSE. Cargo.toml comes from the published
-Cargo.toml.orig, with the additional `tempfile = "3"` dependency; src/error.rs
+Cargo.toml.orig, with additional `tempfile = "3"` and Linux-only `libc = "0.2"`
+dependencies; src/error.rs
 is unchanged. The Cargo patch applies to apkeep and its transitive gpapi user
 without editing the registry cache. Existing public methods and the
 `sha256sum` feature are retained.
@@ -82,6 +83,83 @@ without editing the registry cache. Existing public methods and the
   byte ceiling applies even with an injected client. This API is not a sandbox
   against trusted Rust callers deliberately choosing an unguarded client.
 
+## Pinned output directories and transfer integration
+
+`AsyncDownload` pins its destination on the first `get`/transfer, before network
+access or staging, and keeps that descriptor for its lifetime. Both tempfile
+cleanup and no-clobber publication use its stable descriptor path. Providers
+already holding a guard use `AsyncDownload::new_in(url, &guard, filename)`, which
+owns an independent child descriptor; arbitrary user `/proc/self/fd` paths are
+still rejected. No procfs allowlist, global registry or canonicalization bypass
+is used. Apkeep's five source adapters retain guards at batch boundaries; Google
+keeps gpapi for auth/metadata and uses the shared pinned artifact transport.
+
+Public API:
+
+```rust,no_run
+use std::{io, path::Path};
+use tokio_dl_stream_to_disk::OutputDirectory;
+
+fn example() -> io::Result<()> {
+    let output = OutputDirectory::open(Path::new("./downloads"))?;
+    // Existing child directory; no procfs symlink repinning.
+    let child = output.open_child(Path::new("staging/session"))?;
+    let destination = child.path().join("validated-single-filename.apk");
+    // Keep `child` alive until staging, publication AND cleanup have completed.
+    // Keep filenames single-component and use a no-clobber publication primitive.
+    let _ = destination;
+    Ok(())
+}
+```
+
+- `OutputDirectory::open(&Path) -> io::Result<Self>` accepts existing absolute or
+  current-directory-relative directories. It pins `/` or the current working
+  directory, then walks normal components using `openat` with
+  `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`. Empty paths, `..`, NUL bytes, missing
+  components, nondirectories and symlinks at any user-supplied position fail.
+  `.` and repeated separators are permitted; no canonicalization occurs.
+- Every traversed ancestor must be owned by root or the effective user. Group/
+  other writable ancestors must have the sticky bit. This allows legitimate
+  root-owned `/tmp` fixtures while protecting entry ownership there. The final
+  directory must belong to the effective user and have **no group/other write**
+  bits, including when sticky. No permissions or ownership are changed.
+- `path(&self) -> &Path` yields `/proc/self/fd/N` backed by an owned descriptor.
+  Directory/ancestor renames and replacement of their old names with symlinks
+  cannot redirect operations using that path. Linux procfs is mandatory: the
+  procfs directory's filesystem magic and reopened descriptor's device/inode are
+  verified before returning. Missing/inaccessible/non-procfs paths fail closed.
+  Non-Linux platforms return `io::ErrorKind::Unsupported`, not a pathname fallback.
+- `open_child(&self, &Path) -> io::Result<Self>` walks an existing **relative**
+  child directly from the pinned descriptor, with the same component and trust
+  checks. It rejects absolute paths and `..`. Each returned child independently
+  owns its descriptor and can outlive the parent. It does not create directories.
+  Do not call `open(output.path())`: those procfs links are intentionally rejected.
+- `create(&Path)` and `create_child(&self, &Path)` apply the same no-follow trust
+  checks and create missing components with `mkdirat(..., 0700)` through pinned
+  parents. Existing components are not chmodded. F-Droid config/cache creation
+  uses these methods instead of unguarded `create_dir_all`.
+- Keep the relevant guard alive for staging, existing-file/cache reads, links,
+  publication and temporary-file cleanup, including cancellation. A copied
+  `PathBuf` does **not** extend the descriptor lifetime. For asynchronous code,
+  ensure temporary owners are dropped **before** their directory guard.
+- Callers must still validate single filenames, pin nested child directories and
+  enforce no-clobber publication. Joining absolute paths, `..`, or following
+  untrusted child symlinks bypasses this helper's protection. A trusted `/proc`
+  mount namespace is assumed; malicious mount administration is out of scope.
+- This helper cannot defend against root, same-UID code, the directory owner or
+  anyone allowed to change the pinned inode's permissions/ACLs. Such actors can
+  still delete/replace temp entries, alter data, remove published files or deny
+  service. An anchored path alone does not secure a shared writable target.
+
+`src/output_tests.rs` covers renamed/replaced ancestors and output directories,
+unchanged victim data, forbidden traversal/symlinks, relative paths, unsafe final
+and ancestor permissions, sticky ancestors, foreign ownership (when run as root),
+close-on-exec, independent child lifetime, cancelled tempfile cleanup and
+missing/fake procfs through a private explicit test seam. It makes no network
+requests. Transfer and provider regressions additionally replace ancestors during
+downloads, check publication/cleanup remain in the original directory and verify
+cache reads do not consume redirected victim data.
+
 ## Verification and boundaries
 
 Parent `tests/downloader_dependency.rs` exercises the actual patched dependency:
@@ -106,7 +184,7 @@ in an isolated subprocess. Public address examples are inspected as values;
 the suite makes no public exploit requests or live-store requests.
 
 This does not add fsync/power-loss durability, APK/ZIP validation, a host allowlist,
-or a guarantee against an adversary who can rename the destination directory
-itself. Callbacks are synchronous user code and must not block the executor.
+or protection against root, same-UID code, malicious directory owners or
+post-publication unlink. Callbacks are synchronous user code and must not block the executor.
 Replace/remove this patch only with equivalent tested upstream behavior, not
 by silently dropping the Cargo patch stanza.

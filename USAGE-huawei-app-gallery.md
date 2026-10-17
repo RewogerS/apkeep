@@ -45,7 +45,8 @@ The production HTTP client also rejects private/reserved addresses and URL
 credentials on every redirect; redirect chains are bounded.
 
 The download is streamed to a randomly named temporary file in OUTPATH. The API size
-and SHA256 must both match before the file is atomically published as `<package>.apk`,
+and SHA256 must both match, and the in-process ZIP/binary-manifest validator must pass,
+before the file is atomically published as `<package>.apk`,
 without overwriting any existing path. Normal I/O, transfer, timeout, integrity, and
 publication errors remove the temporary file. A forcibly killed process or machine crash
 can leave an unadvertised temporary file; no incomplete `<package>.apk` is published.
@@ -55,14 +56,23 @@ not reported as a successful skip. This deliberately changes the old skip behavi
 use a fresh output directory for a newly API-checked download. Existing symlinks
 and nonregular output paths are errors. Package IDs are restricted to dot-separated ASCII
 identifier segments and at most 240 bytes; slashes, empty segments and path traversal
-are invalid. These checks protect filenames; they are not a complete Android manifest
-validator.
+are invalid.
 
-SHA256 proves agreement with the API's metadata, not publisher identity or APK signing
-certificate trust. The CLI does not inspect ZIP CRC, the Android manifest's package
-or versionCode, APK signing certificates, or installability. A server can provide
-matching size/SHA256 for non-APK bytes. These publisher/manifest checks belong to a
-separate APK validation layer; they are not implemented or certified here.
+The validator checks every member's decompressed length and ZIP CRC without extracting
+paths. It requires exactly one `AndroidManifest.xml`, parses Android binary XML in Rust,
+and requires the requested package, a positive `versionCode`, and a single base
+`application` element. A supplied numeric API `versionCode` must match the manifest
+exactly (including `versionCodeMajor` when present); if the API omits it, only the
+manifest version's validity can be checked. Explicit malformed API versions fail;
+no expected version is invented. Split/configuration/feature markers and `uses-split`
+are rejected even if the API advertises a full APK.
+
+**These are structural/integrity checks, not publisher authentication.** SHA256 proves
+agreement with API metadata. Neither that digest nor the embedded manifest establishes
+a trusted signing certificate. APK v1/v2/v3 signature cryptography, expected publisher
+fingerprints, malware checks, and Android installability are not verified. In particular,
+an unsigned but structurally valid APK can pass. There is no trusted-publisher claim,
+and no trust root is inferred from the same untrusted APK or API response.
 
 ## Diagnostics, bounds, and batch status
 
@@ -81,14 +91,27 @@ checked against the accepted API size before writing. There are no automatic ret
 requests. `-s` adds the requested delay before each batch item; it is separate from network
 timeouts. Use conservative batch sizes and parallelism to avoid overloading the service.
 
+ZIP inspection first bounds the central directory **before** allocating the general ZIP
+parser: at most 32,768 members and 16 MiB of central-directory metadata. ZIP64,
+multi-disk archives, encryption, non-stored/non-deflate methods, duplicate member names,
+overlapping data, local/central header inconsistencies, symlinks/special members and
+unsafe paths are rejected. Expansion is capped at 2 GiB in total, with a maximum
+1,000:1 member compression ratio; the manifest is capped at 4 MiB. Binary XML has a
+256-element nesting limit and a 16 MiB cumulative decoded-string budget. Inspection
+has a cooperative 60-second deadline checked between directory entries, decompression
+chunks and XML chunks; this is not OS-level preemption of a stalled local filesystem.
+These conservative limits can reject unusually large or nonstandard APKs.
+Production validation needs no `aapt`, Java, `unzip` or other host executable.
+
 
 Production metadata and artifact requests enforce the shared public-network-only
 policy (including DNS and redirects): no URL credentials, private, loopback,
 link-local or reserved addresses; environment proxies are not used. There is no
 CLI/environment bypass. See [RELIABILITY.md](RELIABILITY.md#public-http-boundary).
-OUTPATH and its ancestors must be trusted and not concurrently replaced by other
-users: path-based no-clobber publication is not a dirfd/openat defense against a
-hostile local directory owner.
+OUTPATH is pinned through checked directory descriptors for staging, cleanup
+and publication, including ancestor renames. Linux/procfs is required. This does
+not isolate root, same-UID code or a malicious owner of the pinned directory,
+and cannot prevent authorized entry deletion after publication.
 
 ## Offline regression tests
 
@@ -99,3 +122,8 @@ cargo test --locked --offline --all-targets
 Tests use real loopback TCP/HTTP servers and local files, not the public service. The
 endpoint injection and subprocess diagnostic fixture are private test seams; there is no
 Huawei endpoint override in the production CLI or environment.
+Manifest fixtures are synthetic resource-only APKs compiled during tests using `aapt`
+and `/usr/share/java/com.android.android-23.jar` (Debian `aapt`/`libandroid-23-java`
+packages), with `keytool` and `apksigner` for a locally generated self-signed v1/v2
+fixture. These are test-only prerequisites; missing tools fail the test rather
+than silently skipping validation. No downloaded production APK is committed as a fixture.

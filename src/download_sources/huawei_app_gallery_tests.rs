@@ -1,4 +1,87 @@
+use super::apk_validation::tests::base_apk as fixture;
 use super::*;
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn ancestor_swap_during_huawei_transfer_pins_publication_and_cleanup() {
+    let server = Server::new(|base| {
+        vec![
+            api_reply(&format!("{base}/full.apk")),
+            Reply {
+                body_delay: Duration::from_millis(100),
+                ..Reply::ok(fixture())
+            },
+        ]
+    })
+    .await;
+    let root = tempfile::tempdir().unwrap();
+    let original = root.path().join("out");
+    let moved = root.path().join("moved");
+    let victim = root.path().join("victim");
+    std::fs::create_dir(&original).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    let client = test_client();
+    let (result, ()) = tokio::join!(
+        injected_download_one(
+            &client,
+            &server.endpoint,
+            "com.example.app",
+            None,
+            "CN",
+            &original
+        ),
+        async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while std::fs::read_dir(&original).unwrap().count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            std::fs::rename(&original, &moved).unwrap();
+            std::os::unix::fs::symlink(&victim, &original).unwrap();
+        }
+    );
+    assert!(result.is_ok(), "{result:?}");
+    assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 0);
+    assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read(moved.join("com.example.app.apk")).unwrap(),
+        fixture()
+    );
+}
+
+#[tokio::test]
+async fn matching_api_hash_does_not_publish_non_apk_bytes() {
+    use sha2::{Digest, Sha256};
+    let bytes = b"not a ZIP APK".to_vec();
+    let server = Server::new(|base| {
+        let mut item = entry(&format!("{base}/artifact"));
+        item["size"] = json!(bytes.len());
+        item["fullSize"] = json!(bytes.len());
+        item["sha256"] = json!(hex::encode(Sha256::digest(&bytes)));
+        vec![
+            Reply::ok(serde_json::to_vec(&json!({"rtnCode":0,"list":[item]})).unwrap()),
+            Reply::ok(bytes),
+        ]
+    })
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let result = injected_download_one(
+        &test_client(),
+        &server.endpoint,
+        "com.example.app",
+        None,
+        "IE",
+        out.path(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "matching API metadata must not certify non-APK bytes"
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
 
 #[tokio::test]
 async fn api_apk_size_above_absolute_cap_is_rejected_before_artifact_request() {
@@ -8,7 +91,7 @@ async fn api_apk_size_above_absolute_cap_is_rejected_before_artifact_request() {
         item["fullSize"] = item["size"].clone();
         vec![
             Reply::ok(serde_json::to_vec(&json!({"rtnCode":0,"list":[item]})).unwrap()),
-            Reply::ok(b"abc".to_vec()),
+            Reply::ok(fixture()),
         ]
     })
     .await;
@@ -295,7 +378,7 @@ async fn partial_files_are_unpublished_and_cleaned_on_timeout_or_publication_rac
                     } else {
                         Duration::from_millis(100)
                     },
-                    ..Reply::ok(b"abc".to_vec())
+                    ..Reply::ok(fixture())
                 },
             ]
         })
@@ -335,7 +418,7 @@ async fn partial_files_are_unpublished_and_cleaned_on_timeout_or_publication_rac
         match mode {
             "success" => {
                 result.unwrap();
-                assert_eq!(std::fs::read(&target).unwrap(), b"abc");
+                assert_eq!(std::fs::read(&target).unwrap(), fixture());
             }
             "timeout" => {
                 assert!(result.unwrap_err().contains("timeout"));
@@ -362,11 +445,11 @@ async fn apk_http_and_timeout_errors_never_publish_output() {
         },
         Reply {
             status: 206,
-            ..Reply::ok(b"abc".to_vec())
+            ..Reply::ok(fixture())
         },
         Reply {
             delay: Duration::from_secs(1),
-            ..Reply::ok(b"abc".to_vec())
+            ..Reply::ok(fixture())
         },
     ] {
         let server =
@@ -470,7 +553,7 @@ async fn redirect_targets_must_also_pass_url_validation() {
                 ),
                 ..Reply::ok(Vec::new())
             },
-            Reply::ok(b"abc".to_vec()),
+            Reply::ok(fixture()),
         ]
     })
     .await;
@@ -502,7 +585,7 @@ async fn valid_redirects_work_and_excessive_redirects_are_bounded() {
                     ..Reply::ok(Vec::new())
                 });
             }
-            replies.push(Reply::ok(b"abc".to_vec()));
+            replies.push(Reply::ok(fixture()));
             replies
         })
         .await;
@@ -520,7 +603,7 @@ async fn valid_redirects_work_and_excessive_redirects_are_bounded() {
             result.unwrap();
             assert_eq!(
                 std::fs::read(out.path().join("com.example.app.apk")).unwrap(),
-                b"abc"
+                fixture()
             );
         } else {
             assert_eq!(result.unwrap_err(), "APK HTTP status 302");
@@ -644,34 +727,44 @@ async fn loopback_api_errors_are_distinct_safe_and_never_start_apk_download() {
 }
 
 #[tokio::test]
-async fn loopback_batch_keeps_processing_after_failure_and_aggregates_result() {
+async fn typed_report_huawei_loopback_batch_keeps_processing_after_failure_and_aggregates_result() {
     let server = Server::new(|base| {
         vec![
             Reply::ok(b"{\"rtnCode\":0,\"list\":[]}".to_vec()),
             api_reply(&format!("{base}/full.apk")),
-            Reply::ok(b"abc".to_vec()),
+            Reply::ok(fixture()),
         ]
     })
     .await;
     let out = tempfile::tempdir().unwrap();
-    assert!(
-        !injected_download_batch(
+    let apps = vec![
+        ("com.missing.app".into(), None),
+        ("com.example.app".into(), None),
+    ];
+    let (ok, report) = crate::results::collect(
+        crate::results::Report::new("huawei-app-gallery", "download", apps).unwrap(),
+        injected_download_batch(
             &test_client(),
             &server.endpoint,
             vec![
                 ("com.missing.app".into(), None),
-                ("com.example.app".into(), None)
+                ("com.example.app".into(), None),
             ],
             1,
             0,
             out.path(),
-            "CN"
-        )
-        .await
-    );
+            "CN",
+        ),
+    )
+    .await;
+    assert!(!ok);
+    let value: Value = serde_json::from_slice(&report.json_bytes().unwrap()).unwrap();
+    assert_eq!(value["results"][0]["status"], "unavailable");
+    assert_eq!(value["results"][0]["reason"], "profile_unavailable");
+    assert_eq!(value["results"][1]["status"], "success");
     assert_eq!(
         std::fs::read(out.path().join("com.example.app.apk")).unwrap(),
-        b"abc"
+        fixture()
     );
     assert_eq!(server.requests.lock().unwrap().len(), 3);
 }
@@ -679,10 +772,26 @@ async fn loopback_batch_keeps_processing_after_failure_and_aggregates_result() {
 #[tokio::test]
 async fn rejects_corrupt_short_oversize_and_truncated_downloads_and_cleans_temporary_files() {
     for (body, length, expected) in [
-        (b"abd".to_vec(), None, "SHA256"),
+        (
+            {
+                let mut bytes = fixture();
+                bytes[0] ^= 1;
+                bytes
+            },
+            None,
+            "SHA256",
+        ),
         (b"ab".to_vec(), None, "size"),
-        (b"abcd".to_vec(), None, "size"),
-        (b"ab".to_vec(), Some(3), "transport"),
+        (
+            {
+                let mut bytes = fixture();
+                bytes.push(0);
+                bytes
+            },
+            None,
+            "size",
+        ),
+        (b"ab".to_vec(), Some(fixture().len()), "transport"),
     ] {
         let server = Server::new(|base| {
             vec![
@@ -715,13 +824,9 @@ async fn rejects_corrupt_short_oversize_and_truncated_downloads_and_cleans_tempo
 #[tokio::test]
 async fn loopback_downloads_complete_apk_and_sends_encoded_form() {
     for region in ["IE", "CN"] {
-        let server = Server::new(|base| {
-            vec![
-                api_reply(&format!("{base}/full.apk")),
-                Reply::ok(b"abc".to_vec()),
-            ]
-        })
-        .await;
+        let server =
+            Server::new(|base| vec![api_reply(&format!("{base}/full.apk")), Reply::ok(fixture())])
+                .await;
         let out = tempfile::tempdir().unwrap();
         injected_download_one(
             &test_client(),
@@ -735,7 +840,7 @@ async fn loopback_downloads_complete_apk_and_sends_encoded_form() {
         .unwrap();
         assert_eq!(
             std::fs::read(out.path().join("com.example.app.apk")).unwrap(),
-            b"abc"
+            fixture()
         );
         assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 1);
         let requests = server.requests.lock().unwrap();
@@ -749,8 +854,10 @@ async fn loopback_downloads_complete_apk_and_sends_encoded_form() {
 }
 
 fn entry(url: &str) -> Value {
+    use sha2::Digest;
+    let bytes = fixture();
     json!({"package": "com.example.app", "downurl": url,
-        "size": 3, "fullSize": 3, "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        "size": bytes.len(), "fullSize": bytes.len(), "sha256": hex::encode(sha2::Sha256::digest(&bytes)),
         "isDiff": 0})
 }
 
@@ -852,6 +959,88 @@ fn selects_matching_package_not_first_entry() {
     other["package"] = json!("com.other.app");
     let apk = parse(vec![other, entry("https://example.org/full.apk")]).unwrap();
     assert_eq!(apk.url.as_str(), "https://example.org/full.apk");
-    assert_eq!(apk.size, 3);
+    assert_eq!(apk.size, fixture().len() as u64);
     assert_eq!(apk.sha256.len(), 32);
+}
+#[tokio::test]
+async fn api_version_code_mismatch_is_rejected_before_publication() {
+    let server = Server::new(|base| {
+        let mut item = entry(&format!("{base}/artifact"));
+        item["versionCode"] = json!(43);
+        vec![
+            Reply::ok(serde_json::to_vec(&json!({"rtnCode":0,"list":[item]})).unwrap()),
+            Reply::ok(fixture()),
+        ]
+    })
+    .await;
+    let out = tempfile::tempdir().unwrap();
+    let result = injected_download_one(
+        &test_client(),
+        &server.endpoint,
+        "com.example.app",
+        None,
+        "IE",
+        out.path(),
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "API versionCode must bind the downloaded manifest"
+    );
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn matching_api_integrity_never_publishes_invalid_zip_or_manifest() {
+    use super::apk_validation::tests::{compiled_apk, duplicate_manifest, manifest, repack};
+    use sha2::{Digest, Sha256};
+    let valid = fixture();
+    let mut crc = repack(&manifest(&valid), &[("assets/data", b"original")]);
+    let position = crc.windows(8).position(|b| b == b"original").unwrap();
+    crc[position] ^= 1;
+    for bytes in [
+        compiled_apk("com.other.app", 42, ""),
+        compiled_apk("com.example.app", 42, r#"split="config.en""#),
+        duplicate_manifest(),
+        crc,
+        repack(b"<manifest package='com.example.app'/>", &[]),
+        valid[..valid.len() - 10].to_vec(),
+    ] {
+        let server = Server::new(|base| {
+            let mut item = entry(&format!("{base}/artifact?sig=PRIVATE_TOKEN"));
+            item["size"] = json!(bytes.len());
+            item["fullSize"] = json!(bytes.len());
+            item["sha256"] = json!(hex::encode(Sha256::digest(&bytes)));
+            vec![
+                Reply::ok(serde_json::to_vec(&json!({"rtnCode":0,"list":[item]})).unwrap()),
+                Reply::ok(bytes),
+            ]
+        })
+        .await;
+        let out = tempfile::tempdir().unwrap();
+        let error = injected_download_one(
+            &test_client(),
+            &server.endpoint,
+            "com.example.app",
+            None,
+            "IE",
+            out.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.contains("PRIVATE_TOKEN"));
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn api_version_code_is_optional_but_malformed_values_are_not_ignored() {
+    let mut item = entry("https://example.org/app.apk");
+    assert_eq!(parse(vec![item.clone()]).unwrap().version_code, None);
+    item["versionCode"] = json!(42);
+    assert_eq!(parse(vec![item.clone()]).unwrap().version_code, Some(42));
+    for value in [Value::Null, json!("42"), json!(-1), json!(0), json!(1.5)] {
+        item["versionCode"] = value;
+        assert!(parse(vec![item.clone()]).is_err());
+    }
 }

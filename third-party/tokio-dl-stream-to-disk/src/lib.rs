@@ -3,12 +3,13 @@
 //! # Getting Started
 //!
 //! ```no_run
-//! use std::path::Path;
 //! use tokio_dl_stream_to_disk::AsyncDownload;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     if AsyncDownload::new("https://bit.ly/3yWXSOW", Path::new("/tmp"), "5mb_test.bin").download(&None).await.is_ok() {
+//!     // Keep a private output directory alive, not the shared /tmp directory.
+//!     let output = tempfile::tempdir().expect("private output directory");
+//!     if AsyncDownload::new("https://bit.ly/3yWXSOW", output.path(), "5mb_test.bin").download(&None).await.is_ok() {
 //!         println!("File downloaded successfully!");
 //!     }
 //! }
@@ -16,7 +17,9 @@
 
 pub mod error;
 mod network;
+mod output;
 pub use network::{public_http_client_builder, validate_public_url};
+pub use output::OutputDirectory;
 
 use std::error::Error;
 use std::io::{Error as IOError, ErrorKind};
@@ -61,6 +64,7 @@ mod tests;
 pub struct AsyncDownload {
     url: String,
     dst_path: PathBuf,
+    output: Option<OutputDirectory>,
     fname: String,
     length: Option<u64>,
     response_stream: Option<Box<S>>,
@@ -75,6 +79,7 @@ impl AsyncDownload {
         Self {
             url: url.into(),
             dst_path: dst_path.into(),
+            output: None,
             fname: fname.into(),
             length: None,
             response_stream: None,
@@ -82,6 +87,22 @@ impl AsyncDownload {
             client: None,
             max_bytes: DEFAULT_MAX_BYTES,
         }
+    }
+
+    /// Construct from an already-pinned directory without reopening its procfs path.
+    /// The independent child descriptor outlives transfer cancellation/cleanup.
+    pub fn new_in(url: &str, output: &OutputDirectory, fname: &str) -> std::io::Result<Self> {
+        let mut download = Self::new(url, output.path(), fname);
+        download.output = Some(output.open_child(Path::new("."))?);
+        Ok(download)
+    }
+
+    fn pin_output(&mut self) -> std::io::Result<()> {
+        if self.output.is_none() {
+            self.output = Some(OutputDirectory::open(&self.dst_path)?);
+        }
+        self.dst_path = self.output.as_ref().unwrap().path().to_owned();
+        Ok(())
     }
 
     /// Inject a trusted client, replacing the default public-network policy.
@@ -112,6 +133,7 @@ impl AsyncDownload {
     }
 
     async fn get_non_consumable(&mut self) -> Result<(), Box<dyn Error>> {
+        self.pin_output()?;
         self.validate_destination()
             .map_err(|_| IOError::new(ErrorKind::InvalidInput, "invalid download destination"))?;
         let client = if let Some(client) = &self.client {
@@ -165,9 +187,7 @@ impl AsyncDownload {
                 IOError::new(ErrorKind::InvalidInput, "expected a single safe filename").into(),
             );
         }
-        if !self.dst_path.is_dir() {
-            return Err(TDSTDError::new(TDSTDErrorKind::DirectoryMissing));
-        }
+
         Ok(())
     }
 
@@ -244,6 +264,7 @@ impl AsyncDownload {
         _expected: Option<&[u8]>,
         cb: &Option<Box<dyn Fn(u64) -> ()>>,
     ) -> Result<Vec<u8>, TDSTDError> {
+        self.pin_output()?;
         let path = self.check_output()?;
         if self.response_stream.is_none() {
             self.get_non_consumable()

@@ -10,8 +10,9 @@
 - Status `1` is an aggregate failure, **not** a stable machine-readable "not found"
   code. It also covers unsupported operations, invalid input, network, integrity
   and local I/O errors. Status `2` denotes argument-parser errors. Do not infer
-  store absence from a nonzero exit or missing output; typed per-item absence
-  versus unperformed-check outcomes require a future result-schema change.
+  store absence from a nonzero exit or missing output. Opt-in
+  `--report-json <path>` provides schema-1 ordered typed per-input outcomes;
+  see [RESULTS.md](RESULTS.md) for statuses, bounds, preflight and publication.
 - All input, CSV and OUTPATH diagnostics use stderr, without raw paths/argv or
   Debug-formatted errors. JSON listing stdout is either empty on preflight failure
   or the source's JSON document, never usage/error text.
@@ -44,9 +45,33 @@ can now return a timeout instead of waiting indefinitely. Intentional batch slee
 several finite retries and many apps can still make a whole batch take longer
 than one request deadline. SIGKILL, machine failure, disk failure and filesystem
 semantics are outside normal async-cancellation guarantees. No fsync/crash-durable
-transaction or multi-artifact atomicity is claimed. OUTPATH and its ancestors
-must be trusted and not concurrently replaced by other users; pathname-based
-publication is not a dirfd-based defense against a hostile local filesystem owner.
+transaction or multi-artifact atomicity is claimed.
+
+### Linux filesystem boundary
+
+Every source pins OUTPATH with `OutputDirectory` before network/metadata work,
+without first canonicalizing user input. Shared transfers retain an independent
+directory descriptor, while direct Huawei/RuStore transfers and Google staging,
+nested artifact directories, publication and cleanup use live descriptor paths.
+Google uses gpapi's auth/download metadata API, with artifact transfers through
+the pinned shared downloader rather than gpapi's pathname-only download method.
+F-Droid pins config/cache parents before creating children and keeps them open
+through cache reads and atomic writes. Existing APK hash and cache reads acquire
+regular files with no-follow/nonblocking open flags; cache hits remain reverified.
+
+Linux procfs is required; unsupported platforms fail closed rather than falling
+back to pathname publication. Symlink components and parent traversal are refused.
+Ancestors must be root/euid-owned and non-group/other-writable, except sticky
+ancestors such as `/tmp`; final directories must be euid-owned and not group/other
+writable. Relative paths are supported. Missing config/cache components are
+created with mode 0700 via pinned parents.
+
+Descriptors prevent ancestor rename/symlink replacement from redirecting later
+operations. This does **not** isolate root, same-UID code, malicious directory
+owners, permission/ACL changes, authorized entry deletion or post-publication
+unlink. Final-directory write permission is a trust boundary, not a sandbox or
+a durable multi-file transaction. Private F-Droid metadata workspaces also rely
+on a trusted process temporary directory; untrusted TMPDIR is not supported.
 
 ## Public HTTP boundary
 
@@ -65,8 +90,9 @@ clients are not under this builder's control. Do not describe this as uniform
 SSRF protection for all Google Play paths. Likewise, URL policy and byte limits
 do not verify APK manifests, ZIP CRC, publisher identity, or installability.
 RuStore and APKPure offer no API-checksum authenticity guarantee here. Huawei
-checks agreement with API size/SHA256 only, not the manifest's package/versionCode
-or signing identity. A separate APK validator is required for those guarantees.
+checks API size/SHA256 and additionally performs bounded ZIP/CRC and binary
+manifest package/versionCode/base validation before publication. These structural
+checks do not establish a trusted signing identity or certify installability.
 
 ## CSV and credentials
 
