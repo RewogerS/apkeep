@@ -1,3 +1,4 @@
+use crate::results::{self, Reason, Status};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fs::{self, File};
@@ -19,7 +20,9 @@ use sha2::Sha256;
 use simple_error::SimpleError;
 use tempfile::{tempdir, TempDir};
 use tokio::time::{sleep, Duration};
-use tokio_dl_stream_to_disk::AsyncDownload;
+use tokio_dl_stream_to_disk::{
+    public_http_client_builder, validate_public_url, AsyncDownload, OutputDirectory,
+};
 use x509_certificate::certificate::CapturedX509Certificate;
 
 use crate::config;
@@ -37,29 +40,46 @@ async fn retrieve_index(
     options: &HashMap<&str, &str>,
     mp: Rc<MultiProgress>,
     output_format: OutputFormat,
+    client: Option<&reqwest::Client>,
 ) -> Result<Value, Box<dyn Error>> {
-    let config_dir = config::config_dir()
-        .map_err(|_| SimpleError::new("F-Droid cache directory unavailable."))?;
-    retrieve_index_using_cache(options, mp, output_format, &config_dir).await
+    let config_dir = config::config_directory().map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "F-Droid cache directory unavailable.",
+        )
+    })?;
+    retrieve_index_using_cache_pinned(options, mp, output_format, &config_dir, client).await
 }
 
+#[cfg(test)]
 async fn retrieve_index_using_cache(
     options: &HashMap<&str, &str>,
     mp: Rc<MultiProgress>,
     output_format: OutputFormat,
     config_dir: &Path,
+    client: Option<&reqwest::Client>,
+) -> Result<Value, Box<dyn Error>> {
+    let config_dir = OutputDirectory::open(config_dir)?;
+    retrieve_index_using_cache_pinned(options, mp, output_format, &config_dir, client).await
+}
+
+async fn retrieve_index_using_cache_pinned(
+    options: &HashMap<&str, &str>,
+    mp: Rc<MultiProgress>,
+    output_format: OutputFormat,
+    config_dir: &OutputDirectory,
+    client: Option<&reqwest::Client>,
 ) -> Result<Value, Box<dyn Error>> {
     // Reverify the signed archive on every cache hit. Never reuse the old
     // unsigned JSON cache, shared with verify-index=false and different pins.
     let temp_dir = tempdir()?;
     let (repo, fingerprint, use_entry, verify_index) = repository_options(options)?;
-    validate_output_directory(config_dir)?;
-    let cache_dir = config_dir.join("fdroid-signed-archives");
-    fs::create_dir_all(&cache_dir)?;
-    validate_output_directory(&cache_dir)?;
+    let cache_dir = config_dir.create_child(Path::new("fdroid-signed-archives"))?;
     let cache_name = hex::encode(Sha256::digest(format!("{repo}:{use_entry}")));
-    let cache = cache_dir.join(cache_name);
-    let etag = download_repository_archive(&temp_dir, &repo, use_entry, Some(&cache)).await?;
+    let cache = cache_dir.path().join(&cache_name);
+    let etag =
+        download_repository_archive_pinned(&temp_dir, &repo, use_entry, Some(&cache), client)
+            .await?;
     let files = extract_archive(&temp_dir, &temp_dir.path().join("jar.zip"))?;
     let json = verify_and_return_json(
         &temp_dir,
@@ -70,19 +90,28 @@ async fn retrieve_index_using_cache(
         Rc::clone(&mp),
     )?;
     let index = if use_entry {
-        verify_and_return_index_from_entry(&temp_dir, &repo, &json, verify_index, mp, output_format)
-            .await?
+        verify_and_return_index_from_entry(
+            &temp_dir,
+            &repo,
+            &json,
+            verify_index,
+            mp,
+            output_format,
+            client,
+        )
+        .await?
     } else {
         json
     };
     let parsed = serde_json::from_str(&index)?;
     // Cache only after the full verification/JSON chain has succeeded.
     if let Some(etag) = etag {
-        write_cache_file(
-            &cache.with_extension("jar"),
+        write_cache_file_pinned(
+            &cache_dir,
+            &format!("{cache_name}.jar"),
             &fs::read(temp_dir.path().join("jar.zip"))?,
         )?;
-        write_cache_file(&cache.with_extension("etag"), etag.as_bytes())?;
+        write_cache_file_pinned(&cache_dir, &format!("{cache_name}.etag"), etag.as_bytes())?;
     }
     Ok(parsed)
 }
@@ -171,11 +200,23 @@ pub async fn download_apps(
     outpath: &Path,
     options: HashMap<&str, &str>,
 ) -> bool {
+    download_apps_with_client(apps, parallel, sleep_duration, outpath, options, None).await
+}
+
+async fn download_apps_with_client(
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep_duration: u64,
+    outpath: &Path,
+    options: HashMap<&str, &str>,
+    client: Option<&reqwest::Client>,
+) -> bool {
     let (apps, all_valid) = valid_requests(apps);
     if options
         .get("arch")
         .is_some_and(|value| !safe_component(value))
     {
+        results::batch_error(&apps, Reason::InvalidInput);
         eprintln!("Invalid F-Droid architecture.");
         return false;
     }
@@ -183,29 +224,47 @@ pub async fn download_apps(
         eprintln!("No F-Droid applications requested.");
         return false;
     }
-    if let Err(err) = validate_output_directory(outpath) {
-        eprintln!("F-Droid output path: {}", safe_error_summary(err.as_ref()));
-        return false;
-    }
-    let mp = Rc::new(MultiProgress::new());
-    let index = match retrieve_index(&options, Rc::clone(&mp), OutputFormat::Plaintext).await {
-        Ok(index) => index,
-        Err(err) => {
-            eprintln!(
-                "Could not retrieve verified F-Droid package index: {}",
-                safe_error_summary(err.as_ref())
-            );
+    let output = match OutputDirectory::open(outpath) {
+        Ok(output) => output,
+        Err(_) => {
+            results::batch_error(&apps, Reason::LocalIo);
+            eprintln!("F-Droid: unsafe output directory");
             return false;
         }
     };
-    let downloaded = download_from_index(
+    let mp = Rc::new(MultiProgress::new());
+    let index =
+        match retrieve_index(&options, Rc::clone(&mp), OutputFormat::Plaintext, client).await {
+            Ok(index) => index,
+            Err(err) => {
+                results::batch_error(&apps, results::failure_reason(err.as_ref()));
+                eprintln!(
+                    "Could not retrieve verified F-Droid package index: {}",
+                    safe_error_summary(err.as_ref())
+                );
+                return false;
+            }
+        };
+    let (repo, verified_index) = match repository_options(&options) {
+        Ok((repo, _, _, verified_index)) => (repo, verified_index),
+        Err(_) => {
+            results::batch_error(&apps, Reason::InvalidInput);
+            return false;
+        }
+    };
+    let downloaded = download_from_index_pinned(
         index,
         apps,
         parallel,
         sleep_duration,
-        outpath,
+        &output,
         options.get("arch").map(|value| value.to_string()),
-        mp,
+        RepositoryDownload {
+            repo: &repo,
+            client,
+            progress: mp,
+            verified_index,
+        },
     )
     .await;
     downloaded && all_valid
@@ -218,6 +277,7 @@ fn valid_requests(apps: Vec<(String, Option<String>)>) -> (Vec<(String, Option<S
         .filter(|(id, version)| {
             let valid = safe_component(id) && version.as_deref().is_none_or(safe_component);
             if !valid {
+                results::record(id, version.as_deref(), Status::Error, Reason::InvalidInput);
                 eprintln!("Invalid F-Droid package/version.");
                 all_valid = false;
             }
@@ -227,6 +287,14 @@ fn valid_requests(apps: Vec<(String, Option<String>)>) -> (Vec<(String, Option<S
     (apps, all_valid)
 }
 
+struct RepositoryDownload<'a> {
+    repo: &'a str,
+    client: Option<&'a reqwest::Client>,
+    progress: Rc<MultiProgress>,
+    verified_index: bool,
+}
+
+#[cfg(test)]
 async fn download_from_index(
     index: Value,
     apps: Vec<(String, Option<String>)>,
@@ -234,21 +302,69 @@ async fn download_from_index(
     sleep_duration: u64,
     outpath: &Path,
     arch: Option<String>,
-    mp: Rc<MultiProgress>,
+    repository: RepositoryDownload<'_>,
 ) -> bool {
+    let output = match OutputDirectory::open(outpath) {
+        Ok(output) => output,
+        Err(_) => {
+            results::batch_error(&apps, Reason::LocalIo);
+            eprintln!("F-Droid: unsafe output directory");
+            return false;
+        }
+    };
+    download_from_index_pinned(
+        index,
+        apps,
+        parallel,
+        sleep_duration,
+        &output,
+        arch,
+        repository,
+    )
+    .await
+}
+
+async fn download_from_index_pinned(
+    index: Value,
+    apps: Vec<(String, Option<String>)>,
+    parallel: usize,
+    sleep_duration: u64,
+    output: &OutputDirectory,
+    arch: Option<String>,
+    repository: RepositoryDownload<'_>,
+) -> bool {
+    let outpath = output.path();
+    let RepositoryDownload {
+        repo: configured_repo,
+        client,
+        progress: mp,
+        verified_index,
+    } = repository;
+    // Architecture is common to this batch. Collapse identical app/version
+    // requests before counting selections or spawning jobs for the same path.
+    let mut seen = HashSet::new();
+    let apps: Vec<_> = apps
+        .into_iter()
+        .filter(|app| seen.insert(app.clone()))
+        .collect();
     let requested = apps.len();
     if requested == 0 {
         eprintln!("No F-Droid applications requested.");
         return false;
     }
-    if let Err(err) = validate_output_directory(outpath) {
-        eprintln!("F-Droid output path: {}", safe_error_summary(err.as_ref()));
-        return false;
-    }
-    let (jobs, repo) =
+    // An index may advertise its canonical origin, but it is not routing
+    // authority: both metadata and APK requests stay on the configured mirror.
+    let repo = configured_repo.to_owned();
+    let requests = apps.clone();
+    let failures: Vec<_> = apps
+        .iter()
+        .map(|(id, _)| selection_failure(&index, id))
+        .collect();
+    let (jobs, _advertised_repo) =
         match parse_json_for_download_information(index, apps, arch.clone(), Rc::clone(&mp)) {
             Ok(info) => info,
             Err(err) => {
+                results::batch_error(&requests, Reason::Integrity);
                 eprintln!(
                     "Could not parse F-Droid package index: {}",
                     safe_error_summary(&err)
@@ -256,6 +372,16 @@ async fn download_from_index(
                 return false;
             }
         };
+    for ((id, version), (status, reason)) in requests.iter().zip(failures) {
+        if !jobs.iter().any(|job| &job.0 == id && &job.1 == version) {
+            let (status, reason) = if status == Status::NotFound && !verified_index {
+                (Status::Error, Reason::Integrity)
+            } else {
+                (status, reason)
+            };
+            results::record(id, version.as_deref(), status, reason);
+        }
+    }
     let complete_selection = jobs.len() == requested;
     if !complete_selection {
         eprintln!("Some requested F-Droid applications or variants are unavailable/invalid.");
@@ -265,90 +391,111 @@ async fn download_from_index(
         let arch = arch.clone();
         let mp = Rc::clone(&mp);
         async move {
-            let mut label = id;
-            if let Some(version) = version {
-                label.push('@');
-                label.push_str(&version);
-            }
-            if let Some(arch) = arch {
-                label.push('@');
-                label.push_str(&arch);
-            }
-            let filename = format!("{label}.apk");
-            if filename.len() > 255 {
-                eprintln!("F-Droid output filename too long: {label}");
-                return false;
-            }
-            let target = outpath.join(&filename);
-            match fs::symlink_metadata(&target) {
-                Ok(metadata) => {
-                    // Existing regular files are successful skips only when the
-                    // complete expected digest matches. Symlinks are never skips.
-                    let ok = if metadata.file_type().is_file() {
-                        match file_matches_sha256(&target, &hash) {
-                            Ok(matches) => matches,
-                            Err(err) => {
-                                eprintln!(
-                                    "Could not verify existing {}: {}",
-                                    target.display(),
-                                    safe_error_summary(&err)
-                                );
-                                false
-                            }
-                        }
-                    } else {
-                        false
-                    };
-                    if !ok {
-                        eprintln!(
-                            "Unsafe or mismatching existing F-Droid destination: {}",
-                            target.display()
-                        );
-                    }
-                    return ok;
+            results::observe(&id, version.as_deref(), async {
+                results::note(Status::Error, Reason::Integrity);
+                let mut label = id.clone();
+                if let Some(version) = &version {
+                    label.push('@');
+                    label.push_str(version);
                 }
-                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    eprintln!(
-                        "Could not inspect {}: {}",
-                        target.display(),
-                        safe_error_summary(&err)
-                    );
+                if let Some(arch) = arch {
+                    label.push('@');
+                    label.push_str(&arch);
+                }
+                let filename = format!("{label}.apk");
+                if filename.len() > 255 {
+                    results::note(Status::Error, Reason::InvalidInput);
+                    eprintln!("F-Droid output filename too long: {label}");
                     return false;
                 }
-            }
-            if sleep_duration > 0 {
-                sleep(Duration::from_millis(sleep_duration)).await;
-            }
-            let url = format!(
-                "{}/{}",
-                repo.trim_end_matches('/'),
-                name.trim_start_matches('/')
-            );
-            for attempt in 1..=3 {
-                let transfer = async {
-                    let mut dl = AsyncDownload::new(&url, outpath, &filename).get().await?;
-                    let cb = dl
-                        .length()
-                        .map(|length| progress_wrapper(Rc::clone(&mp))(filename.clone(), length));
-                    dl.download_and_verify_sha256(&hash, &cb)
-                        .await
-                        .map_err(|_| SimpleError::new("APK SHA256-verified transfer failed."))?;
-                    Ok::<(), Box<dyn Error>>(())
-                };
-                match tokio::time::timeout(REQUEST_TIMEOUT, transfer).await {
-                    Ok(Ok(())) => {
-                        println!("{label} downloaded successfully!");
-                        return true;
+                let target = outpath.join(&filename);
+                match fs::symlink_metadata(&target) {
+                    Ok(metadata) => {
+                        // Existing regular files are successful skips only when the
+                        // complete expected digest matches. Symlinks are never skips.
+                        let ok = if metadata.file_type().is_file() {
+                            match file_matches_sha256(&target, &hash).await {
+                                Ok(matches) => matches,
+                                Err(err) => {
+                                    results::note(Status::Error, results::failure_reason(&err));
+                                    eprintln!(
+                                        "Could not verify existing {}: {}",
+                                        target.display(),
+                                        safe_error_summary(&err)
+                                    );
+                                    false
+                                }
+                            }
+                        } else {
+                            results::note(Status::Error, Reason::LocalIo);
+                            false
+                        };
+                        if !ok {
+                            eprintln!(
+                                "Unsafe or mismatching existing F-Droid destination: {}",
+                                target.display()
+                            );
+                        }
+                        if ok {
+                            results::complete();
+                        }
+                        return ok;
                     }
-                    Ok(Err(err)) => eprintln!(
-                        "F-Droid {label}, attempt {attempt}/3: {}",
-                        safe_error_summary(err.as_ref())
-                    ),
-                    Err(_) => eprintln!("F-Droid {label}, attempt {attempt}/3 timed out."),
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        results::note(Status::Error, Reason::LocalIo);
+                        eprintln!(
+                            "Could not inspect {}: {}",
+                            target.display(),
+                            safe_error_summary(&err)
+                        );
+                        return false;
+                    }
                 }
-            }
-            false
+                if sleep_duration > 0 {
+                    sleep(Duration::from_millis(sleep_duration)).await;
+                }
+                let url = format!(
+                    "{}/{}",
+                    repo.trim_end_matches('/'),
+                    name.trim_start_matches('/')
+                );
+                for attempt in 1..=3 {
+                    let transfer = async {
+                        let download = AsyncDownload::new_in(&url, output, &filename)?
+                            .with_max_bytes(MAX_APK_BYTES)
+                            .with_client(http_client_for_url(&url, client)?);
+                        let mut dl = download.get().await?;
+                        let cb = dl.length().map(|length| {
+                            progress_wrapper(Rc::clone(&mp))(filename.clone(), length)
+                        });
+                        dl.download_and_verify_sha256(&hash, &cb)
+                            .await
+                            .map_err(results::download_failure)?;
+                        Ok::<(), Box<dyn Error>>(())
+                    };
+                    match tokio::time::timeout(REQUEST_TIMEOUT, transfer).await {
+                        Ok(Ok(())) => {
+                            println!("{label} downloaded successfully!");
+                            results::complete();
+                            return true;
+                        }
+                        Ok(Err(err)) => {
+                            results::note(Status::Error, results::failure_reason(err.as_ref()));
+                            eprintln!(
+                                "F-Droid {label}, attempt {attempt}/3: {}",
+                                safe_error_summary(err.as_ref())
+                            );
+                        }
+                        Err(_) => {
+                            results::note(Status::Error, Reason::Timeout);
+                            eprintln!("F-Droid {label}, attempt {attempt}/3 timed out.");
+                        }
+                    }
+                }
+                false
+            })
+            .await
         }
     }))
     .buffer_unordered(parallel.max(1))
@@ -357,14 +504,63 @@ async fn download_from_index(
     complete_selection && !outcomes.is_empty() && outcomes.into_iter().all(|ok| ok)
 }
 
-fn file_matches_sha256(path: &Path, expected: &[u8]) -> Result<bool, io::Error> {
-    let mut file = File::open(path)?;
+async fn file_matches_sha256(path: &Path, expected: &[u8]) -> Result<bool, io::Error> {
+    file_matches_sha256_bounded(path, expected, MAX_APK_BYTES, REQUEST_TIMEOUT).await
+}
+
+async fn file_matches_sha256_bounded(
+    path: &Path,
+    expected: &[u8],
+    limit: u64,
+    deadline: Duration,
+) -> Result<bool, io::Error> {
+    tokio::time::timeout(deadline, async {
+        let mut options = tokio::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        let mut file = options.open(path).await?;
+        let metadata = file.metadata().await?;
+        if !metadata.is_file() || metadata.len() > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Existing APK exceeds size policy.",
+            ));
+        }
+        hash_reader_matches(&mut file, expected, limit).await
+    })
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "Existing APK verification timed out.",
+        )
+    })?
+}
+
+async fn hash_reader_matches<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    expected: &[u8],
+    limit: u64,
+) -> Result<bool, io::Error> {
+    use tokio::io::AsyncReadExt;
+    // Size precheck alone is insufficient if a regular file grows while read.
+    // Consume at most limit + 1 bytes with a fixed 8 KiB buffer.
+    let mut reader = reader.take(limit.saturating_add(1));
     let mut hasher = Sha256::new();
+    let mut received = 0u64;
     let mut buffer = [0; 8192];
     loop {
-        let length = file.read(&mut buffer)?;
+        let length = reader.read(&mut buffer).await?;
         if length == 0 {
             break;
+        }
+        received += length as u64;
+        if received > limit {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Existing APK exceeds size policy.",
+            ));
         }
         hasher.update(&buffer[..length]);
     }
@@ -372,6 +568,57 @@ fn file_matches_sha256(path: &Path, expected: &[u8]) -> Result<bool, io::Error> 
 }
 
 type DownloadInformation = (Vec<(String, Option<String>, String, Vec<u8>)>, String);
+// Classify an unsuccessful selection without treating corrupt metadata as
+// authoritative package absence. Only a missing key in a verified index is absent.
+fn selection_failure(index: &Value, id: &str) -> (Status, Reason) {
+    let Some(packages) = index.get("packages").and_then(Value::as_object) else {
+        return (Status::Error, Reason::Integrity);
+    };
+    let Some(package) = packages.get(id) else {
+        return (Status::NotFound, Reason::PackageAbsent);
+    };
+    let valid_hash = |v: Option<&str>| {
+        v.and_then(|v| hex::decode(v).ok())
+            .is_some_and(|h| h.len() == 32)
+    };
+    let valid_name =
+        |v: Option<&str>| v.is_some_and(|v| safe_repo_name(v.strip_prefix('/').unwrap_or(v)));
+    let valid_abis = |value: Option<&Value>| {
+        value.is_none_or(|v| {
+            v.as_array().is_some_and(|abis| {
+                abis.iter()
+                    .all(|abi| abi.as_str().is_some_and(safe_component))
+            })
+        })
+    };
+    let valid = if let Some(entries) = package.as_array() {
+        !entries.is_empty()
+            && entries.iter().all(|entry| {
+                entry.get("versionName").and_then(Value::as_str).is_some()
+                    && entry.get("versionCode").and_then(Value::as_u64).is_some()
+                    && valid_hash(entry.get("hash").and_then(Value::as_str))
+                    && valid_name(entry.get("apkName").and_then(Value::as_str))
+                    && valid_abis(entry.get("nativecode"))
+            })
+    } else if let Some(entries) = package.get("versions").and_then(Value::as_object) {
+        !entries.is_empty()
+            && entries.values().all(|entry| {
+                entry["manifest"]["versionName"].as_str().is_some()
+                    && entry["manifest"]["versionCode"].as_u64().is_some()
+                    && valid_hash(entry["file"]["sha256"].as_str())
+                    && valid_name(entry["file"]["name"].as_str())
+                    && valid_abis(entry["manifest"].get("nativecode"))
+            })
+    } else {
+        false
+    };
+    if valid {
+        (Status::Unavailable, Reason::VariantUnavailable)
+    } else {
+        (Status::Error, Reason::Integrity)
+    }
+}
+
 /// This currently works for `index-v1.json` as well as an index with version `20002`.  It is
 /// flexible enough to parse either, and may work on future index versions as well.  Since `sha256`
 /// digests are checked before proceeding, I don't foresee this having an insecure failure mode, so
@@ -414,7 +661,19 @@ fn parse_json_for_download_information(
             }
             match packages.get(&app_id) {
                 Some(Value::Array(app_array)) => {
-                    for single_app in app_array {
+                    let mut candidates: Vec<&Value> = app_array.iter().collect();
+                    if app_version.is_none() {
+                        candidates.retain(|candidate| {
+                            candidate
+                                .get("versionCode")
+                                .and_then(Value::as_u64)
+                                .is_some()
+                        });
+                        candidates.sort_by_key(|candidate| {
+                            std::cmp::Reverse(candidate["versionCode"].as_u64().unwrap_or(0))
+                        });
+                    }
+                    for single_app in candidates {
                         if let Value::Object(fdroid_app) = single_app {
                             if let Some(Value::String(version_name)) = fdroid_app.get("versionName")
                             {
@@ -567,6 +826,14 @@ pub async fn list_versions(
     apps: Vec<(String, Option<String>)>,
     options: HashMap<&str, &str>,
 ) -> bool {
+    list_versions_with_client(apps, options, None).await
+}
+
+async fn list_versions_with_client(
+    apps: Vec<(String, Option<String>)>,
+    options: HashMap<&str, &str>,
+    client: Option<&reqwest::Client>,
+) -> bool {
     let (apps, all_valid) = valid_requests(apps);
     let output_format = if options
         .get("output_format")
@@ -584,11 +851,13 @@ pub async fn list_versions(
         &options,
         Rc::new(MultiProgress::new()),
         output_format.clone(),
+        client,
     )
     .await
     {
         Ok(index) => index,
         Err(err) => {
+            results::batch_error(&apps, results::failure_reason(err.as_ref()));
             print_error(
                 &format!(
                     "Could not retrieve F-Droid package index: {}",
@@ -599,7 +868,9 @@ pub async fn list_versions(
             return false;
         }
     };
-    match parse_json_display_versions(index, apps, output_format.clone()) {
+    let verified_index = repository_options(&options).is_ok_and(|(_, _, _, verify)| verify);
+    match parse_json_display_versions_with_trust(index, apps, output_format.clone(), verified_index)
+    {
         Ok(()) => all_valid,
         Err(err) => {
             // The parser has already emitted its single JSON result, including
@@ -614,14 +885,24 @@ pub async fn list_versions(
 }
 
 /// The comments for `parse_json_for_download_information` apply here, too.
+#[cfg(test)]
 fn parse_json_display_versions(
     index: Value,
     apps: Vec<(String, Option<String>)>,
     output_format: OutputFormat,
 ) -> Result<(), FDroidError> {
+    parse_json_display_versions_with_trust(index, apps, output_format, true)
+}
+fn parse_json_display_versions_with_trust(
+    index: Value,
+    apps: Vec<(String, Option<String>)>,
+    output_format: OutputFormat,
+    verified_index: bool,
+) -> Result<(), FDroidError> {
     let packages = match index.get("packages").and_then(Value::as_object) {
         Some(packages) => packages,
         None => {
+            results::batch_error(&apps, Reason::Integrity);
             print_error("Invalid F-Droid package index.", output_format);
             return Err(FDroidError::Dummy);
         }
@@ -661,6 +942,14 @@ fn parse_json_display_versions(
             }
         }
         if versions.is_empty() {
+            let (status, reason) = if !valid {
+                (Status::Error, Reason::InvalidInput)
+            } else if verified_index && !packages.contains_key(&app_id) {
+                (Status::NotFound, Reason::PackageAbsent)
+            } else {
+                (Status::Error, Reason::Integrity)
+            };
+            results::record(&app_id, version.as_deref(), status, reason);
             all_ok = false;
             eprintln!("No F-Droid versions available for {app_id} (invalid, missing or malformed package).");
             json_root.insert(
@@ -669,6 +958,12 @@ fn parse_json_display_versions(
             );
             continue;
         }
+        results::record(
+            &app_id,
+            version.as_deref(),
+            Status::Success,
+            Reason::Complete,
+        );
         let mut versions: Vec<_> = versions.into_iter().collect();
         versions.sort();
         if output_format.is_plaintext() {
@@ -876,6 +1171,7 @@ async fn verify_and_return_index_from_entry(
     verify_index: bool,
     _mp: Rc<MultiProgress>,
     _output_format: OutputFormat,
+    client: Option<&reqwest::Client>,
 ) -> Result<String, Box<dyn Error>> {
     let entry: Value = serde_json::from_str(json)?;
     let index = entry.get("index").ok_or(FDroidError::Dummy)?;
@@ -915,15 +1211,34 @@ async fn verify_and_return_index_from_entry(
         hash.as_deref(),
         MAX_METADATA_BYTES,
         REQUEST_TIMEOUT,
+        client,
     )
     .await?;
     read_bounded_string(&dir.path().join(index_name), MAX_METADATA_BYTES)
 }
 
+const MAX_APK_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_METADATA_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
+// A caller-supplied client is an explicit trusted transport seam, used by
+// loopback fixtures only. Production entry points always pass None. Initial
+// URLs need validation as literal IPs never reach reqwest's DNS resolver.
+fn http_client_for_url(
+    url: &str,
+    injected: Option<&reqwest::Client>,
+) -> Result<reqwest::Client, Box<dyn Error>> {
+    if let Some(client) = injected {
+        return Ok(client.clone());
+    }
+    validate_public_url(&reqwest::Url::parse(url)?)?;
+    Ok(public_http_client_builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .build()?)
+}
 
 fn safe_component(value: &str) -> bool {
     !value.is_empty()
@@ -944,14 +1259,15 @@ fn safe_repo_name(value: &str) -> bool {
 }
 
 fn read_bounded_string(path: &Path, limit: u64) -> Result<String, Box<dyn Error>> {
-    let metadata = fs::symlink_metadata(path)?;
+    let input = open_regular_nofollow(path)?;
+    let metadata = input.metadata()?;
     if !metadata.file_type().is_file() || metadata.len() > limit {
         return Err(Box::new(SimpleError::new(
             "Invalid or oversized F-Droid metadata file.",
         )));
     }
     let mut bytes = Vec::new();
-    File::open(path)?.take(limit + 1).read_to_end(&mut bytes)?;
+    input.take(limit + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
         return Err(Box::new(SimpleError::new(
             "F-Droid metadata exceeds size limit.",
@@ -967,89 +1283,52 @@ async fn download_metadata(
     expected: Option<&[u8]>,
     limit: u64,
     deadline: Duration,
+    client: Option<&reqwest::Client>,
 ) -> Result<(), Box<dyn Error>> {
     if !safe_repo_name(name) {
         return Err(Box::new(SimpleError::new("Invalid F-Droid metadata path.")));
     }
-    let target = dir.join(name);
-    let parent = target.parent().ok_or(FDroidError::Dummy)?;
-    fs::create_dir_all(parent)?;
-    validate_output_directory(parent)?;
+    let directory = OutputDirectory::open(dir)?;
+    let relative = Path::new(name);
+    let parent = directory.create_child(
+        relative
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new(".")),
+    )?;
+    let target = parent
+        .path()
+        .join(relative.file_name().ok_or(FDroidError::Dummy)?);
     let leaf = target
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or(FDroidError::Dummy)?;
-    let exceeded = Rc::new(std::cell::Cell::new(false));
-    let notify = Rc::new(tokio::sync::Notify::new());
-    let signal = Rc::clone(&notify);
-    let flag = Rc::clone(&exceeded);
-    let cb: Option<Box<dyn Fn(u64)>> = Some(Box::new(move |count| {
-        if count > limit {
-            flag.set(true);
-            signal.notify_one();
-        }
-    }));
     let download = async {
-        let mut dl = AsyncDownload::new(url, parent, leaf).get().await?;
+        let download = AsyncDownload::new_in(url, &parent, leaf)?
+            .with_max_bytes(limit)
+            .with_client(http_client_for_url(url, client)?);
+        let mut dl = download.get().await?;
         if dl.length().is_some_and(|length| length > limit) {
             return Err::<(), Box<dyn Error>>(Box::new(SimpleError::new(
                 "F-Droid metadata exceeds size limit.",
             )));
         }
         if let Some(expected) = expected {
-            dl.download_and_verify_sha256(expected, &cb)
+            dl.download_and_verify_sha256(expected, &None)
                 .await
-                .map_err(|_| SimpleError::new("Index SHA256-verified transfer failed."))?;
+                .map_err(results::sha256_failure)?;
         } else {
-            dl.download(&cb)
+            dl.download(&None)
                 .await
-                .map_err(|_| SimpleError::new("Index transfer failed."))?;
+                .map_err(results::download_failure)?;
         }
         Ok(())
     };
-    let result = tokio::time::timeout(deadline, async {
-        tokio::select! {
-            biased;
-            _ = notify.notified() => Err(Box::new(SimpleError::new("F-Droid metadata exceeds size limit.")) as Box<dyn Error>),
-            result = download => result,
-        }
-    }).await?;
-    if exceeded.get() {
-        // The callback can fire on the last chunk. Even if the download future
-        // wins that poll, an oversized metadata file is never used.
-        if fs::symlink_metadata(&target).is_ok() {
-            fs::remove_file(&target)?;
-        }
-        return Err(Box::new(SimpleError::new(
-            "F-Droid metadata exceeds size limit.",
-        )));
-    }
-    result
+    tokio::time::timeout(deadline, download).await?
 }
 
 fn validate_output_directory(path: &Path) -> Result<(), Box<dyn Error>> {
-    let mut current = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir | std::path::Component::Prefix(_) => {
-                return Err(Box::new(SimpleError::new(
-                    "Unsafe F-Droid output directory.",
-                )));
-            }
-            std::path::Component::CurDir => current.push("."),
-            _ => current.push(component.as_os_str()),
-        }
-        if !fs::symlink_metadata(&current)?.file_type().is_dir() {
-            return Err(Box::new(SimpleError::new(
-                "F-Droid output directory must contain only real directories (no symlinks).",
-            )));
-        }
-    }
-    if !fs::symlink_metadata(path)?.file_type().is_dir() {
-        return Err(Box::new(SimpleError::new(
-            "F-Droid output path is not a directory.",
-        )));
-    }
+    OutputDirectory::open(path)?;
     Ok(())
 }
 
@@ -1089,11 +1368,33 @@ fn get_signed_data_from_cert_file(
     }
 }
 
+#[cfg(test)]
 async fn download_repository_archive(
     dir: &TempDir,
     repo: &str,
     use_entry: bool,
     cache: Option<&Path>,
+    client: Option<&reqwest::Client>,
+) -> Result<Option<String>, Box<dyn Error>> {
+    let parent = cache
+        .map(|cache| -> Result<_, Box<dyn Error>> {
+            Ok(OutputDirectory::open(
+                cache.parent().ok_or(FDroidError::Dummy)?,
+            )?)
+        })
+        .transpose()?;
+    let cache = cache
+        .zip(parent.as_ref())
+        .map(|(cache, parent)| parent.path().join(cache.file_name().unwrap()));
+    download_repository_archive_pinned(dir, repo, use_entry, cache.as_deref(), client).await
+}
+
+async fn download_repository_archive_pinned(
+    dir: &TempDir,
+    repo: &str,
+    use_entry: bool,
+    cache: Option<&Path>,
+    client: Option<&reqwest::Client>,
 ) -> Result<Option<String>, Box<dyn Error>> {
     let url = format!(
         "{}/{}",
@@ -1104,10 +1405,7 @@ async fn download_repository_archive(
             "index-v1.jar"
         }
     );
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()?;
+    let client = http_client_for_url(&url, client)?;
     let mut request = client.get(&url);
     if let Some(cache) = cache {
         let jar = cache.with_extension("jar");
@@ -1124,13 +1422,30 @@ async fn download_repository_archive(
         let cache = cache
             .ok_or_else(|| SimpleError::new("Unexpected F-Droid 304 without signed cache."))?;
         let cached = cache.with_extension("jar");
-        if !regular_cache_exists(&cached)? || fs::metadata(&cached)?.len() > MAX_METADATA_BYTES {
+        let mut input = open_regular_nofollow(&cached)?;
+        if input.metadata()?.len() > MAX_METADATA_BYTES {
             return Err(Box::new(SimpleError::new("Invalid F-Droid signed cache.")));
         }
-        fs::copy(&cached, dir.path().join("jar.zip"))?;
+        let mut output = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.path().join("jar.zip"))?;
+        if io::copy(&mut (&mut input).take(MAX_METADATA_BYTES + 1), &mut output)?
+            > MAX_METADATA_BYTES
+        {
+            return Err(Box::new(SimpleError::new("Invalid F-Droid signed cache.")));
+        }
+        output.flush()?;
         return Ok(None);
     }
     let response = response.error_for_status()?;
+    // error_for_status alone accepts stopped redirects (3xx). Only the cache
+    // branch above may accept 304; reject every other non-success before output.
+    if !response.status().is_success() {
+        return Err(Box::new(SimpleError::new(
+            "F-Droid repository archive returned a non-success HTTP status.",
+        )));
+    }
     let etag = response
         .headers()
         .get(reqwest::header::ETAG)
@@ -1179,15 +1494,50 @@ fn regular_cache_exists(path: &Path) -> Result<bool, Box<dyn Error>> {
     }
 }
 
+#[cfg(test)]
 fn write_cache_file(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn Error>> {
-    regular_cache_exists(path)?;
     let parent = path.parent().ok_or(FDroidError::Dummy)?;
-    validate_output_directory(parent)?;
-    let mut file = tempfile::NamedTempFile::new_in(parent)?;
+    let parent = OutputDirectory::open(parent)?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(FDroidError::Dummy)?;
+    write_cache_file_pinned(&parent, name, bytes)
+}
+
+fn write_cache_file_pinned(
+    parent: &OutputDirectory,
+    name: &str,
+    bytes: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    if !safe_component(name) {
+        return Err(Box::new(FDroidError::Dummy));
+    }
+    let path = parent.path().join(name);
+    regular_cache_exists(&path)?;
+    let mut file = tempfile::NamedTempFile::new_in(parent.path())?;
     file.write_all(bytes)?;
     file.flush()?;
-    file.persist(path)?;
+    file.persist(&path)?;
     Ok(())
+}
+
+fn open_regular_nofollow(path: &Path) -> io::Result<File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let input = options.open(path)?;
+    if !input.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "expected a regular file",
+        ));
+    }
+    Ok(input)
 }
 
 fn extract_archive(dir: &TempDir, jar: &Path) -> Result<Vec<String>, Box<dyn Error>> {

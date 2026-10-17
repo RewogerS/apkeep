@@ -126,10 +126,10 @@ You can use this tool to download from a few distinct sources.
 * The Google Play Store (`-d google-play`), given an email address and AAS token
 * APKPure (`-d apk-pure`), a third-party site hosting APKs available on the Play Store
 * Huawei AppGallery (`-d huawei-app-gallery`), with explicit regional selection and
-  verified full-APK downloads; see [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
+  API-size/SHA256-checked downloads; see [`USAGE-huawei-app-gallery.md`](USAGE-huawei-app-gallery.md)
 * F-Droid (`-d f-droid`), a repository for free and open-source Android apps. `apkeep`
-verifies that these APKs are signed by the F-Droid maintainers, and alerts the user if an APK
-was downloaded but could not be verified
+authenticates the repository index and checks each APK against its indexed SHA256
+before publication; an APK that fails verification is not published
 * RuStore (`-d ru-store`), a Russian app store platform
 
 ## Usage Note

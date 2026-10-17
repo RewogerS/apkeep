@@ -101,6 +101,7 @@ dependencies = [
  "gpapi",
  "hex",
  "indicatif",
+ "libc",
  "regex",
  "reqwest 0.13.5",
  "ring",
@@ -2428,6 +2429,7 @@ version = "1.0.2"
 dependencies = [
  "bytes",
  "futures-util",
+ "libc",
  "reqwest 0.13.5",
  "sha2",
  "tempfile",

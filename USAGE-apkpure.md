@@ -19,8 +19,8 @@ apkeep -a com.instagram.android -d apk-pure -o 'acknowledge_dangers=true,arch=ar
 You can also list the versions available, either specifying a specific architecture or not. This does not require the `acknowledge_dangers=true` option:
 
 ```shell
-apkeep -l -a com.instagram.android -o 'arch=x86'
-apkeep -l -a com.instagram.android
+apkeep -l -d apk-pure -a com.instagram.android -o 'arch=x86'
+apkeep -l -d apk-pure -a com.instagram.android
 ```
 
 ### Reliability and input handling
@@ -55,8 +55,21 @@ without panicking. Artifact header requests are additionally bounded to 30
 seconds, and each of at most three body-download attempts to 300 seconds (the
 shared downloader may apply stricter deadlines).
 
-Existing regular output files are skipped without revalidating their content or
-provenance; directories and symlinks are failures, not successful skips. These
+Existing regular output files are preserved but rejected as unverified, rather
+than reported as successful skips (a deliberate compatibility change). A destination
+created during publication is also an unverified failure, not a reason to repeat
+the download. Use a fresh output directory. Directories and symlinks are failures. These
 reliability checks do **not** make APKPure trustworthy, validate APK signatures,
 or add an APKPure checksum/authenticity guarantee. The research-only warning
 above still applies.
+
+Artifacts are capped at 2 GiB, including unknown-length/chunked responses, with
+limits enforced before writes by the shared downloader.
+
+Production metadata and artifact requests enforce the shared public-network-only
+policy (including DNS and redirects): no URL credentials, private, loopback,
+link-local or reserved addresses; environment proxies are not used. There is no
+CLI/environment bypass. See [RELIABILITY.md](RELIABILITY.md#public-http-boundary).
+OUTPATH and its ancestors must be trusted and not concurrently replaced by other
+users: path-based no-clobber publication is not a dirfd/openat defense against a
+hostile local directory owner.

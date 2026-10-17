@@ -94,6 +94,18 @@ Optionally, the path to this `ini` file can be specified:
 apkeep -a com.instagram.android -d google-play -i ~/path/to/some.ini .
 ```
 
+## Device-constructor failures
+
+Custom device properties are read from a regular file into a private snapshot,
+limited to 256 KiB, before gpapi construction. Unknown built-in devices, missing
+or malformed custom files, missing profiles and typed-field parsing failures
+produce a controlled, redacted device-configuration error before authentication
+or other network work (including OAuth-to-AAS exchange). gpapi 6.1.0 exposes only
+panicking constructors; a narrow synchronous unwind boundary suppresses only
+those constructor panic diagnostics on the current thread, forwarding unrelated
+panics to the previous hook. This is not a claim that all later gpapi internals
+are panic-free or use the shared public-network HTTP policy.
+
 ## Failure handling and output safety
 
 - A batch succeeds only if every requested app succeeds. Failed apps, unsupported

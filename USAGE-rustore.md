@@ -3,7 +3,8 @@
 Select RuStore with `-d ru-store`. Only the latest available version is supported;
 `package@version` requests are skipped with a diagnostic and make the download
 command fail. Listing versions with
-`-l` explains this limitation rather than returning historical versions.
+`-l` reports that version listing is unsupported on stderr and exits with status `1`,
+without a network lookup. This is not a "not found" result.
 
 ```shell
 apkeep -a com.vk.calls -d ru-store .
@@ -78,28 +79,34 @@ printing response bodies or signed download URLs.
 ## Exit status and output safety
 
 RuStore download commands exit with status `0` only when every requested app
-was downloaded successfully or its existing regular output file was skipped.
+was downloaded successfully. Pre-existing output files are preserved but rejected
+as unverified, rather than counted as successful downloads (a deliberate change
+from the old skip behavior).
 Invalid selected configuration/environment, an empty app list, unsupported
 version pins, invalid package names, lookup/link/API/HTTP errors, and failed or
 empty downloads produce a nonzero status. Batch processing still attempts every
 item and keeps successful downloads even when other items fail. Diagnostics go
-to stderr; progress and successful-download/skip messages go to stdout. Invalid
+to stderr; progress and successful-download messages go to stdout. Invalid
 option values, untrusted version strings, response bodies and signed download
 URLs are not printed.
 
 For downloads, `-r/--parallel` must be greater than zero (for every source), and
 is rejected before starting downloads or Google authentication. RuStore also
 validates this in its download helper. `-l` remains an offline explanation of the
-latest-only limitation; it does not validate unused download options.
+latest-only limitation with a failure status; it validates package IDs but does
+not validate unused download options.
 
 Package names must consist of dot-separated nonempty ASCII identifiers, each
-starting with a letter or `_`, followed by letters, digits or `_`. Path separators,
+starting with a letter or `_`, followed by letters, digits or `_`, at most 240
+bytes total (including separators, leaving room for `.apk`). Path separators,
 query/fragment syntax and control characters are rejected before RuStore network
 requests. Output is named `<package>.apk` inside OUTPATH. Existing symlinks and
 other nonregular entries are errors, not successful skips. New downloads use a
 private temporary file, are flushed before no-clobber publication, and are cleaned
 up after failed transfers; a failed retry cannot turn a partial file into success.
-There are at most three transfer attempts.
+There are at most three transfer attempts. Publication failures are terminal: a
+concurrently created destination is not trusted or overwritten and the artifact
+is not downloaded again just to retry publication.
 
 ### Fixed network and resource limits
 
@@ -123,9 +130,19 @@ These limits are fixed production policy, not additional `-o` options or
 environment variables. The existing API endpoints, device/header precedence,
 latest-only and split-APK rules are unchanged.
 
-Existing regular files are preserved **without revalidation**. A successful HTTP
-transfer is not an APK signature, ZIP/manifest, or API-checksum verification; use a
+Existing regular files are preserved **without revalidation and with a failure
+status**. A successful new HTTP transfer is not an APK signature, ZIP/manifest,
+or API-checksum verification; use a
 fresh output directory and independently verify downloaded APKs when required.
+
+
+Production metadata and artifact requests enforce the shared public-network-only
+policy (including DNS and redirects): no URL credentials, private, loopback,
+link-local or reserved addresses; environment proxies are not used. There is no
+CLI/environment bypass. See [RELIABILITY.md](RELIABILITY.md#public-http-boundary).
+OUTPATH and its ancestors must be trusted and not concurrently replaced by other
+users: path-based no-clobber publication is not a dirfd/openat defense against a
+hostile local directory owner.
 
 ## Split APK limitation
 

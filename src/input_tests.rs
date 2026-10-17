@@ -1,6 +1,22 @@
 //! Shared input contracts; fixtures never contain real credentials.
 
 #[test]
+fn single_app_empty_version_matches_csv_latest_and_preserves_nonempty_version() {
+    assert_eq!(
+        single_app("com.example.app@"),
+        parse_csv_text("com.example.app,".into(), 1, Some(2)).unwrap()[0]
+    );
+    assert_eq!(
+        single_app("com.example.app@1"),
+        ("com.example.app".into(), Some("1".into()))
+    );
+    assert_eq!(
+        single_app("com.example.app"),
+        ("com.example.app".into(), None)
+    );
+}
+
+#[test]
 fn csv_explicit_empty_record_in_batch_is_error_not_a_blank_line() {
     for (text, version) in [
         ("com.example.app\n\"\"\n", None),

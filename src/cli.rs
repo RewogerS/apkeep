@@ -163,6 +163,14 @@ pub fn app() -> Command {
                 .required(false),
         )
         .arg(
+            Arg::new("report_json")
+                .long("report-json")
+                .value_name("path")
+                .help("Write a bounded per-input JSON report (no overwrite)")
+                .conflicts_with("google_oauth_token")
+                .action(ArgAction::Set),
+        )
+        .arg(
             Arg::new("OUTPATH")
                 .help("Path to store output files")
                 .action(ArgAction::Set)
